@@ -105,6 +105,10 @@ backend/data/*
 # the self-updater as a second-line integrity check when the release's
 # SHA256SUMS.txt asset can't be fetched.
 !backend/data/release_digests.json
+# Issue #244/#245/#246: one-shot carrier-position seed shipped with each
+# release. Used ONLY on first-ever startup to bootstrap carrier_cache.json;
+# after that the cache reflects this install's own GDELT observations.
+!backend/data/carrier_seed.json
 
 # OS generated files
 .DS_Store

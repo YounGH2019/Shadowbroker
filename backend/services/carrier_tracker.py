@@ -1,46 +1,90 @@
 """
 Carrier Strike Group OSINT Tracker
 ===================================
-Scrapes multiple OSINT sources to maintain current estimated positions
-for US Navy Carrier Strike Groups. Updates on startup + 00:00 & 12:00 UTC.
+Maintains estimated positions for US Navy Carrier Strike Groups with
+honest provenance and freshness signals.
 
-Sources:
-  1. GDELT News API — recent carrier movement headlines
-  2. WikiVoyage / public port-call databases
-  3. Fallback — last-known or static OSINT estimates
+Issues #244 / #245 / #246 (tg12 external audit):
+
+The previous implementation baked a snapshot of USNI News Fleet &
+Marine Tracker positions (March 9, 2026) into the registry as
+``fallback_lat``/``fallback_lng`` and stamped ``updated = now()``
+every time the dossier was rendered. That presented stale editorial
+data as live state. It also persisted GDELT-derived positions to the
+on-disk cache with no freshness signal, so a single news mention from
+months ago could keep overriding the (already-stale) registry default
+indefinitely.
+
+Architecture after this PR:
+
+::
+
+    backend/data/carrier_seed.json   read-only, shipped with image,
+                                     used ONCE on first-ever startup
+                                     to bootstrap carrier_cache.json.
+
+    backend/data/carrier_cache.json  mutable, lives in the runtime data
+                                     volume, written by every GDELT
+                                     refresh + any future source.
+
+Startup flow:
+
+1.  ``carrier_cache.json`` exists?  → load it.
+2.  Otherwise, copy ``carrier_seed.json`` → ``carrier_cache.json``,
+    then load it. (This happens once, ever, per install.)
+3.  Background: GDELT fetch runs. Any carrier mentioned in fresh news
+    gets its entry replaced with the news-derived position.
+    ``position_source_at`` is set to the news article timestamp.
+
+Freshness is a *labelling* decision, not an eviction decision:
+
+- ``position_source_at`` within the configurable freshness window
+  (default 14 days) → ``position_confidence = "recent"``.
+- Older than that              → ``position_confidence = "stale"``.
+- Bootstrapped from the seed file (never updated) → ``"seed"``.
+- No cache entry at all (e.g. a carrier added to the registry after
+  first install) → carrier renders at its homeport with
+  ``"homeport_default"``.
+
+Carriers are never hidden, never teleported, never disappeared. The
+position the user sees is always the last position the system actually
+observed, with an honest "as-of" timestamp the UI can render however
+it likes. A year from now, the runtime cache reflects whatever this
+install has observed via GDELT — not the seed snapshot.
 """
 
-import re
+import os
 import json
 import time
 import logging
 import threading
 import random
-from datetime import datetime, timezone
+import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from services.network_utils import fetch_with_curl
 
 logger = logging.getLogger(__name__)
 
 # -----------------------------------------------------------------
-# Carrier registry: hull number → metadata + fallback position
+# Carrier registry: hull number → identity only.
+#
+# Issue #244 (tg12): the previous registry carried hard-coded
+# ``fallback_lat``/``fallback_lng`` that were dated editorial
+# snapshots from a 2026-03-09 article. Those fields are DELETED. The
+# registry is now identity + homeport only; positions are sourced
+# exclusively from carrier_cache.json (and via that, from the
+# bootstrap seed or live OSINT).
 # -----------------------------------------------------------------
 CARRIER_REGISTRY: Dict[str, dict] = {
-    # Fallback positions sourced from USNI News Fleet & Marine Tracker (Mar 9, 2026)
-    # https://news.usni.org/2026/03/09/usni-news-fleet-and-marine-tracker-march-9-2026
     # --- Bremerton, WA (Naval Base Kitsap) ---
-    # Distinct pier positions along Sinclair Inlet so carriers don't stack
     "CVN-68": {
         "name": "USS Nimitz (CVN-68)",
         "wiki": "https://en.wikipedia.org/wiki/USS_Nimitz",
         "homeport": "Bremerton, WA",
         "homeport_lat": 47.5535,
         "homeport_lng": -122.6400,
-        "fallback_lat": 47.5535,
-        "fallback_lng": -122.6400,
-        "fallback_heading": 90,
-        "fallback_desc": "Bremerton, WA (Maintenance)",
     },
     "CVN-76": {
         "name": "USS Ronald Reagan (CVN-76)",
@@ -48,23 +92,14 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "Bremerton, WA",
         "homeport_lat": 47.5580,
         "homeport_lng": -122.6360,
-        "fallback_lat": 47.5580,
-        "fallback_lng": -122.6360,
-        "fallback_heading": 90,
-        "fallback_desc": "Bremerton, WA (Decommissioning)",
     },
     # --- Norfolk, VA (Naval Station Norfolk) ---
-    # Piers run N-S along Willoughby Bay; each carrier gets a distinct berth
     "CVN-69": {
         "name": "USS Dwight D. Eisenhower (CVN-69)",
         "wiki": "https://en.wikipedia.org/wiki/USS_Dwight_D._Eisenhower",
         "homeport": "Norfolk, VA",
         "homeport_lat": 36.9465,
         "homeport_lng": -76.3265,
-        "fallback_lat": 36.9465,
-        "fallback_lng": -76.3265,
-        "fallback_heading": 0,
-        "fallback_desc": "Norfolk, VA (Post-deployment maintenance)",
     },
     "CVN-78": {
         "name": "USS Gerald R. Ford (CVN-78)",
@@ -72,10 +107,6 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "Norfolk, VA",
         "homeport_lat": 36.9505,
         "homeport_lng": -76.3250,
-        "fallback_lat": 18.0,
-        "fallback_lng": 39.5,
-        "fallback_heading": 0,
-        "fallback_desc": "Red Sea — Operation Epic Fury (USNI Mar 9)",
     },
     "CVN-74": {
         "name": "USS John C. Stennis (CVN-74)",
@@ -83,10 +114,6 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "Norfolk, VA",
         "homeport_lat": 36.9540,
         "homeport_lng": -76.3235,
-        "fallback_lat": 36.98,
-        "fallback_lng": -76.43,
-        "fallback_heading": 0,
-        "fallback_desc": "Newport News, VA (RCOH refueling overhaul)",
     },
     "CVN-75": {
         "name": "USS Harry S. Truman (CVN-75)",
@@ -94,10 +121,6 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "Norfolk, VA",
         "homeport_lat": 36.9580,
         "homeport_lng": -76.3220,
-        "fallback_lat": 36.0,
-        "fallback_lng": 15.0,
-        "fallback_heading": 0,
-        "fallback_desc": "Mediterranean Sea deployment (USNI Mar 9)",
     },
     "CVN-77": {
         "name": "USS George H.W. Bush (CVN-77)",
@@ -105,23 +128,14 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "Norfolk, VA",
         "homeport_lat": 36.9620,
         "homeport_lng": -76.3210,
-        "fallback_lat": 36.5,
-        "fallback_lng": -74.0,
-        "fallback_heading": 0,
-        "fallback_desc": "Atlantic — Pre-deployment workups (USNI Mar 9)",
     },
     # --- San Diego, CA (Naval Base San Diego) ---
-    # Carrier piers along the east shore of San Diego Bay, spread N-S
     "CVN-70": {
         "name": "USS Carl Vinson (CVN-70)",
         "wiki": "https://en.wikipedia.org/wiki/USS_Carl_Vinson",
         "homeport": "San Diego, CA",
         "homeport_lat": 32.6840,
         "homeport_lng": -117.1290,
-        "fallback_lat": 32.6840,
-        "fallback_lng": -117.1290,
-        "fallback_heading": 180,
-        "fallback_desc": "San Diego, CA (Homeport)",
     },
     "CVN-71": {
         "name": "USS Theodore Roosevelt (CVN-71)",
@@ -129,10 +143,6 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "San Diego, CA",
         "homeport_lat": 32.6885,
         "homeport_lng": -117.1280,
-        "fallback_lat": 32.6885,
-        "fallback_lng": -117.1280,
-        "fallback_heading": 180,
-        "fallback_desc": "San Diego, CA (Maintenance)",
     },
     "CVN-72": {
         "name": "USS Abraham Lincoln (CVN-72)",
@@ -140,10 +150,6 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "San Diego, CA",
         "homeport_lat": 32.6925,
         "homeport_lng": -117.1275,
-        "fallback_lat": 20.0,
-        "fallback_lng": 64.0,
-        "fallback_heading": 0,
-        "fallback_desc": "Arabian Sea — Operation Epic Fury (USNI Mar 9)",
     },
     # --- Yokosuka, Japan (CFAY) ---
     "CVN-73": {
@@ -152,16 +158,18 @@ CARRIER_REGISTRY: Dict[str, dict] = {
         "homeport": "Yokosuka, Japan",
         "homeport_lat": 35.2830,
         "homeport_lng": 139.6700,
-        "fallback_lat": 35.2830,
-        "fallback_lng": 139.6700,
-        "fallback_heading": 180,
-        "fallback_desc": "Yokosuka, Japan (Forward deployed)",
     },
 }
 
 # -----------------------------------------------------------------
-# Region → approximate center coordinates
-# Used to map textual geographic descriptions to lat/lng
+# Region → approximate center coordinates.
+#
+# Issue #245 (tg12): converting a region name straight into precise
+# map coordinates is false precision. We still use this table to
+# infer a coarse position from a headline mention, but the resulting
+# carrier object is now stamped ``position_confidence = "approximate"``
+# so the UI can render an uncertainty radius / dimmed icon. The
+# centroid is a best-effort midpoint of the named body of water.
 # -----------------------------------------------------------------
 REGION_COORDS: Dict[str, tuple] = {
     # Oceans & Seas
@@ -220,9 +228,39 @@ REGION_COORDS: Dict[str, tuple] = {
 }
 
 # -----------------------------------------------------------------
-# Cache file for persisting positions between restarts
+# Files
 # -----------------------------------------------------------------
-CACHE_FILE = Path(__file__).parent.parent / "carrier_cache.json"
+#
+# The seed lives in the read-only image data dir (it ships with each
+# release). The cache lives in the same data dir but is written at
+# runtime; under Docker compose this dir is volume-mounted so the
+# cache persists across container restarts, which is the whole point
+# of the seed-then-observe model — the user's runtime observations
+# survive image upgrades.
+SEED_FILE = Path(__file__).parent.parent / "data" / "carrier_seed.json"
+CACHE_FILE = Path(__file__).parent.parent / "data" / "carrier_cache.json"
+
+# -----------------------------------------------------------------
+# Freshness window for position_confidence labeling. Issue #246 (tg12):
+# previously persisted cache entries had no freshness signal at all.
+# After this change, the position itself is preserved (we never lose
+# what was last observed) but the confidence label flips from
+# "recent" to "stale" once the underlying source is older than this
+# window. Operator-overridable via env var.
+# -----------------------------------------------------------------
+_DEFAULT_FRESHNESS_WINDOW_DAYS = 14
+
+
+def _freshness_window_days() -> int:
+    raw = str(os.environ.get("SHADOWBROKER_CARRIER_FRESHNESS_DAYS", "") or "").strip()
+    if not raw:
+        return _DEFAULT_FRESHNESS_WINDOW_DAYS
+    try:
+        n = int(raw)
+        return n if n > 0 else _DEFAULT_FRESHNESS_WINDOW_DAYS
+    except (TypeError, ValueError):
+        return _DEFAULT_FRESHNESS_WINDOW_DAYS
+
 
 _carrier_positions: Dict[str, dict] = {}
 _positions_lock = threading.Lock()
@@ -234,25 +272,159 @@ _GDELT_REQUEST_DELAY_SECONDS = 1.25
 _GDELT_REQUEST_JITTER_SECONDS = 0.35
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        # Python's fromisoformat accepts +00:00 but not 'Z' until 3.11.
+        normalized = ts.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except (TypeError, ValueError):
+        return None
+
+
+def _compute_position_confidence(entry: dict, *, now: Optional[datetime] = None) -> str:
+    """Return the public confidence label for a carrier cache entry.
+
+    Order of precedence:
+      - explicit "homeport_default" / "seed" labels are preserved.
+      - dated entries (with position_source_at) are "recent" if within
+        the configured freshness window, else "stale".
+      - missing position_source_at falls through to "stale".
+    """
+    raw_label = str(entry.get("position_confidence", "") or "").strip()
+    # Explicit "kind of provenance" labels are preserved as-is. They
+    # describe HOW we got the position, not WHEN — a fresh headline-to-
+    # centroid match (#245) is still imprecise no matter how recently
+    # it was observed, and the seed (#244) is always the seed.
+    if raw_label in {"seed", "homeport_default", "approximate"}:
+        # Approximate entries can still age into "stale_approximate" if
+        # they fall out of the freshness window — that distinction lets
+        # the UI render a different badge for old-and-imprecise vs
+        # recent-and-imprecise. seed/homeport_default never age (they
+        # were never timestamped against real observations).
+        if raw_label == "approximate":
+            source_at = _parse_iso(str(entry.get("position_source_at", "") or ""))
+            if source_at is not None:
+                reference = now or datetime.now(timezone.utc)
+                if reference - source_at > timedelta(days=_freshness_window_days()):
+                    return "stale_approximate"
+        return raw_label
+
+    source_at = _parse_iso(str(entry.get("position_source_at", "") or ""))
+    if not source_at:
+        return "stale"
+
+    reference = now or datetime.now(timezone.utc)
+    window = timedelta(days=_freshness_window_days())
+    if reference - source_at <= window:
+        return "recent"
+    return "stale"
+
+
+def _load_seed() -> Dict[str, dict]:
+    """Load the read-only seed file shipped with the image.
+
+    Returns a hull→entry dict (no _meta wrapper). Missing or malformed
+    seed files yield an empty dict — the caller falls back to homeport
+    defaults.
+    """
+    try:
+        if not SEED_FILE.exists():
+            logger.info("Carrier seed file not present at %s; first-run will fall back to homeport defaults", SEED_FILE)
+            return {}
+        raw = json.loads(SEED_FILE.read_text(encoding="utf-8"))
+        carriers = raw.get("carriers", {}) if isinstance(raw, dict) else {}
+        if not isinstance(carriers, dict):
+            return {}
+        logger.info("Carrier seed loaded: %d entries from %s", len(carriers), SEED_FILE)
+        return carriers
+    except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
+        logger.warning("Failed to load carrier seed file %s: %s", SEED_FILE, e)
+        return {}
+
+
 def _load_cache() -> Dict[str, dict]:
-    """Load cached carrier positions from disk."""
+    """Load the mutable cache (last-known positions persisted between restarts)."""
     try:
         if CACHE_FILE.exists():
-            data = json.loads(CACHE_FILE.read_text())
-            logger.info(f"Carrier cache loaded: {len(data)} carriers from {CACHE_FILE}")
-            return data
+            data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                logger.info("Carrier cache loaded: %d carriers from %s", len(data), CACHE_FILE)
+                return data
     except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
-        logger.warning(f"Failed to load carrier cache: {e}")
+        logger.warning("Failed to load carrier cache: %s", e)
     return {}
 
 
-def _save_cache(positions: Dict[str, dict]):
-    """Persist carrier positions to disk."""
+def _save_cache(positions: Dict[str, dict]) -> None:
+    """Persist the mutable cache. Atomic write (temp + rename) so a crash
+    mid-write can't leave the file truncated."""
     try:
-        CACHE_FILE.write_text(json.dumps(positions, indent=2))
-        logger.info(f"Carrier cache saved: {len(positions)} carriers")
+        CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CACHE_FILE.with_suffix(CACHE_FILE.suffix + ".tmp")
+        tmp.write_text(json.dumps(positions, indent=2), encoding="utf-8")
+        # On Windows os.replace is atomic and overwrites existing files.
+        os.replace(tmp, CACHE_FILE)
+        logger.info("Carrier cache saved: %d carriers", len(positions))
     except (IOError, OSError) as e:
-        logger.warning(f"Failed to save carrier cache: {e}")
+        logger.warning("Failed to save carrier cache: %s", e)
+
+
+def _homeport_entry_for(hull: str) -> Optional[dict]:
+    """Return a homeport-default cache entry for a hull, or None if the
+    hull is not in the registry."""
+    info = CARRIER_REGISTRY.get(hull)
+    if not info:
+        return None
+    return {
+        "lat": info["homeport_lat"],
+        "lng": info["homeport_lng"],
+        "heading": 0,
+        "desc": f"{info['homeport']} (no observations yet)",
+        "source": f"Homeport default ({info['homeport']})",
+        "source_url": info.get("wiki", ""),
+        "position_source_at": _now_iso(),
+        "position_confidence": "homeport_default",
+    }
+
+
+def _bootstrap_cache_if_missing() -> Dict[str, dict]:
+    """One-shot: if no cache exists, materialize one from the seed file.
+
+    Returns the cache contents (hull→entry). On first-ever startup,
+    this writes ``carrier_cache.json`` so subsequent restarts skip the
+    seed entirely. Operator-deleted caches re-bootstrap the same way —
+    operators can use that to "reset" carrier positions, but it's an
+    explicit operator action.
+    """
+    if CACHE_FILE.exists():
+        return _load_cache()
+
+    seed = _load_seed()
+    if not seed:
+        # No seed file either. Build a homeport-default cache so the
+        # first save_cache call still produces something honest.
+        homeports: Dict[str, dict] = {}
+        for hull in CARRIER_REGISTRY:
+            entry = _homeport_entry_for(hull)
+            if entry is not None:
+                homeports[hull] = entry
+        if homeports:
+            _save_cache(homeports)
+        return homeports
+
+    # Persist the seed as the first cache so subsequent runs skip this branch.
+    _save_cache(seed)
+    logger.info("Carrier cache bootstrapped from seed (first-ever startup)")
+    return dict(seed)
 
 
 def _match_region(text: str) -> Optional[tuple]:
@@ -270,10 +442,8 @@ def _match_carrier(text: str) -> Optional[str]:
     for hull, info in CARRIER_REGISTRY.items():
         hull_check = hull.lower().replace("-", "")
         name_parts = info["name"].lower()
-        # Match hull number (e.g., "CVN-78", "CVN78")
         if hull.lower() in text_lower or hull_check in text_lower.replace("-", ""):
             return hull
-        # Match ship name (e.g., "Ford", "Eisenhower", "Vinson")
         ship_name = name_parts.split("(")[0].strip()
         last_name = ship_name.split()[-1] if ship_name else ""
         if last_name and len(last_name) > 3 and last_name in text_lower:
@@ -323,8 +493,9 @@ def _fetch_gdelt_carrier_news() -> List[dict]:
             articles = data.get("articles", [])
             for art in articles:
                 title = art.get("title", "")
-                url = art.get("url", "")
-                results.append({"title": title, "url": url})
+                article_url = art.get("url", "")
+                article_at = art.get("seendate") or art.get("date") or ""
+                results.append({"title": title, "url": article_url, "seendate": article_at})
         except (ConnectionError, TimeoutError, ValueError, KeyError, OSError) as e:
             logger.debug(f"GDELT search failed for '{term}': {e}")
             continue
@@ -340,108 +511,139 @@ def _fetch_gdelt_carrier_news() -> List[dict]:
     return results
 
 
+def _gdelt_seendate_to_iso(seendate: str) -> Optional[str]:
+    """GDELT returns YYYYMMDDhhmmss (UTC). Convert to ISO8601 for
+    position_source_at. Returns None if the input is unparseable."""
+    raw = (seendate or "").strip()
+    if len(raw) < 8 or not raw.isdigit():
+        return None
+    try:
+        dt = datetime.strptime(raw[:14] if len(raw) >= 14 else raw[:8] + "000000", "%Y%m%d%H%M%S")
+        return dt.replace(tzinfo=timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return None
+
+
 def _parse_carrier_positions_from_news(articles: List[dict]) -> Dict[str, dict]:
-    """Parse carrier positions from news article titles and descriptions."""
+    """Parse carrier positions from news article titles.
+
+    Issue #245 (tg12): the position is a region centroid, which is
+    coarse — we now stamp ``position_confidence = "approximate"`` so
+    the UI can render that uncertainty. Issue #244: the
+    ``position_source_at`` field is the news article's actual seen
+    date, NOT now(), so the freshness check correctly flips entries
+    to "stale" once they age past the configured window.
+    """
     updates: Dict[str, dict] = {}
 
     for article in articles:
         title = article.get("title", "")
-
-        # Try to match a carrier from the title
         hull = _match_carrier(title)
         if not hull:
             continue
-
-        # Try to match a region from the title
         coords = _match_region(title)
         if not coords:
             continue
 
-        # Only update if we haven't seen this carrier yet (first match wins — most recent)
+        # First match wins (most recent article, GDELT returns newest first
+        # per term).
         if hull not in updates:
+            iso_at = _gdelt_seendate_to_iso(str(article.get("seendate", ""))) or _now_iso()
             updates[hull] = {
                 "lat": coords[0],
                 "lng": coords[1],
+                "heading": 0,
                 "desc": title[:100],
-                "source": "GDELT News API",
+                "source": "GDELT News API (headline region match — approximate)",
                 "source_url": article.get("url", "https://api.gdeltproject.org"),
-                "updated": datetime.now(timezone.utc).isoformat(),
+                "position_source_at": iso_at,
+                # Headline-to-centroid match is explicitly approximate.
+                "position_confidence": "approximate",
             }
             logger.info(
-                f"Carrier update: {CARRIER_REGISTRY[hull]['name']} → {coords} (from: {title[:80]})"
+                "Carrier update: %s → %s (from: %s)",
+                CARRIER_REGISTRY[hull]["name"],
+                coords,
+                title[:80],
             )
 
     return updates
 
 
-def _load_carrier_fallbacks() -> Dict[str, dict]:
-    """Build carrier positions from static fallbacks + disk cache (instant, no network)."""
-    positions: Dict[str, dict] = {}
-    for hull, info in CARRIER_REGISTRY.items():
-        positions[hull] = {
-            "name": info["name"],
-            "lat": info["fallback_lat"],
-            "lng": info["fallback_lng"],
-            "heading": info["fallback_heading"],
-            "desc": info["fallback_desc"],
-            "wiki": info["wiki"],
-            "source": "USNI News Fleet & Marine Tracker",
-            "source_url": "https://news.usni.org/category/fleet-tracker",
-            "updated": datetime.now(timezone.utc).isoformat(),
-        }
-
-    # Overlay cached positions from previous runs (may have GDELT data)
-    cached = _load_cache()
-    for hull, cached_pos in cached.items():
-        if hull in positions:
-            if cached_pos.get("source", "").startswith("GDELT") or cached_pos.get(
-                "source", ""
-            ).startswith("News"):
-                positions[hull].update(
-                    {
-                        "lat": cached_pos["lat"],
-                        "lng": cached_pos["lng"],
-                        "desc": cached_pos.get("desc", positions[hull]["desc"]),
-                        "source": cached_pos.get("source", "Cached OSINT"),
-                        "updated": cached_pos.get("updated", ""),
-                    }
-                )
-    return positions
+def _enrich_for_rendering(hull: str, entry: dict, *, now: Optional[datetime] = None) -> dict:
+    """Add live computed fields (confidence label, last_osint_update)
+    on top of the persisted cache entry. The persisted entry is left
+    untouched; this function builds the public-facing object.
+    """
+    info = CARRIER_REGISTRY.get(hull, {})
+    confidence = _compute_position_confidence(entry, now=now)
+    return {
+        "name": entry.get("name", info.get("name", hull)),
+        "lat": entry["lat"],
+        "lng": entry["lng"],
+        "heading": entry.get("heading", 0),
+        "desc": entry.get("desc", ""),
+        "wiki": entry.get("wiki", info.get("wiki", "")),
+        "source": entry.get("source", "OSINT estimated position"),
+        "source_url": entry.get("source_url", ""),
+        "position_source_at": entry.get("position_source_at", ""),
+        "position_confidence": confidence,
+        # Existing field preserved for backward compatibility with the
+        # current frontend ShipPopup; now reflects the SOURCE's observed
+        # time (not now()), so "last reported X days ago" is honest.
+        "last_osint_update": entry.get("position_source_at", ""),
+        # Convenience boolean for the UI: true when the position is
+        # NOT live OSINT (used to render dimmed icons / badges).
+        "is_fallback": confidence in {"seed", "stale", "stale_approximate", "homeport_default"},
+    }
 
 
-def update_carrier_positions():
-    """Main update function — called on startup and every 12h.
+def update_carrier_positions() -> None:
+    """Refresh carrier positions.
 
-    Phase 1 (instant): publish fallback + cached positions so the map has carriers immediately.
-    Phase 2 (slow):    query GDELT for fresh OSINT positions and update in-place.
+    Phase 1 (instant): publish whatever's in carrier_cache.json (or
+    bootstrap from seed on first-ever run), so the map has carriers
+    immediately.
+
+    Phase 2 (slow): query GDELT and replace position entries for any
+    carrier mentioned in fresh news. Persist back to cache.
     """
     global _last_update
 
-    # --- Phase 1: instant fallback + cache ---
-    positions = _load_carrier_fallbacks()
+    # --- Phase 1: instant cache (bootstrap from seed on first-ever run) ---
+    positions = _bootstrap_cache_if_missing()
+
+    # Ensure every registered hull has SOMETHING in the cache. A hull
+    # the seed didn't cover (e.g. added after install) renders at its
+    # homeport with "homeport_default" confidence.
+    for hull in CARRIER_REGISTRY:
+        if hull not in positions:
+            entry = _homeport_entry_for(hull)
+            if entry is not None:
+                positions[hull] = entry
 
     with _positions_lock:
-        # Only overwrite if positions are currently empty (first startup).
-        # If we already have data from a previous cycle, keep it while GDELT runs.
         if not _carrier_positions:
             _carrier_positions.update(positions)
             _last_update = datetime.now(timezone.utc)
     logger.info(
-        f"Carrier tracker: {len(positions)} carriers loaded from fallback/cache (GDELT enrichment starting...)"
+        "Carrier tracker: %d carriers loaded from cache (GDELT enrichment starting...)",
+        len(positions),
     )
 
-    # --- Phase 2: slow GDELT enrichment ---
+    # --- Phase 2: GDELT enrichment ---
     try:
         articles = _fetch_gdelt_carrier_news()
         news_positions = _parse_carrier_positions_from_news(articles)
         for hull, pos in news_positions.items():
-            if hull in positions:
-                positions[hull].update(pos)
-                logger.info(f"Carrier OSINT: updated {CARRIER_REGISTRY[hull]['name']} from news")
+            # Always overwrite — newest GDELT mention wins. The previous
+            # entry's position is preserved in git history and the next
+            # cycle either confirms or replaces it.
+            positions[hull] = pos
+            logger.info("Carrier OSINT: updated %s from news", CARRIER_REGISTRY[hull]["name"])
     except (ValueError, KeyError, json.JSONDecodeError, OSError) as e:
-        logger.warning(f"GDELT carrier fetch failed: {e}")
+        logger.warning("GDELT carrier fetch failed: %s", e)
 
-    # Save and update the global state with enriched positions
     with _positions_lock:
         _carrier_positions.clear()
         _carrier_positions.update(positions)
@@ -449,21 +651,15 @@ def update_carrier_positions():
 
     _save_cache(positions)
 
-    sources = {}
-    for p in positions.values():
-        src = p.get("source", "unknown")
-        sources[src] = sources.get(src, 0) + 1
-    logger.info(f"Carrier tracker: {len(positions)} carriers updated. Sources: {sources}")
+    confidences: Dict[str, int] = {}
+    for entry in positions.values():
+        label = _compute_position_confidence(entry)
+        confidences[label] = confidences.get(label, 0) + 1
+    logger.info("Carrier tracker: %d carriers updated. Confidence: %s", len(positions), confidences)
 
 
 def _deconflict_positions(result: List[dict]) -> List[dict]:
-    """Offset carriers that share identical coordinates so they don't stack.
-
-    At port: offset along the pier axis (~500m / 0.004° apart).
-    At sea: offset perpendicular to each other (~0.08° / ~9km apart)
-    so they're visibly separate but clearly operating together.
-    """
-    # Group by rounded lat/lng (within ~0.01° ≈ 1km = same spot)
+    """Offset carriers that share identical coordinates so they don't stack."""
     from collections import defaultdict
 
     groups: dict[str, list[int]] = defaultdict(list)
@@ -475,7 +671,6 @@ def _deconflict_positions(result: List[dict]) -> List[dict]:
         if len(indices) < 2:
             continue
         n = len(indices)
-        # Determine if this is a port (near a homeport) or at sea
         sample = result[indices[0]]
         at_port = any(
             abs(sample["lat"] - info.get("homeport_lat", 0)) < 0.05
@@ -484,7 +679,6 @@ def _deconflict_positions(result: List[dict]) -> List[dict]:
         )
 
         if at_port:
-            # Use each carrier's distinct homeport pier coordinates
             for idx in indices:
                 carrier = result[idx]
                 hull = None
@@ -497,8 +691,7 @@ def _deconflict_positions(result: List[dict]) -> List[dict]:
                     carrier["lat"] = info["homeport_lat"]
                     carrier["lng"] = info["homeport_lng"]
         else:
-            # At sea: spread in a line perpendicular to travel (~0.08° apart)
-            spacing = 0.08  # ~9km — close enough to see they're together
+            spacing = 0.08
             start_offset = -(n - 1) * spacing / 2
             for j, idx in enumerate(indices):
                 result[idx]["lng"] += start_offset + j * spacing
@@ -507,36 +700,44 @@ def _deconflict_positions(result: List[dict]) -> List[dict]:
 
 
 def get_carrier_positions() -> List[dict]:
-    """Return current carrier positions for the data pipeline."""
+    """Return current carrier positions for the data pipeline.
+
+    Each entry has the full provenance + freshness fields; the UI can
+    decide how to render them. Carriers are never hidden — only
+    labeled.
+    """
+    now = datetime.now(timezone.utc)
     with _positions_lock:
-        result = []
-        for hull, pos in _carrier_positions.items():
-            info = CARRIER_REGISTRY.get(hull, {})
+        result: List[dict] = []
+        for hull, entry in _carrier_positions.items():
+            enriched = _enrich_for_rendering(hull, entry, now=now)
             result.append(
                 {
-                    "name": pos.get("name", info.get("name", hull)),
+                    "name": enriched["name"],
                     "type": "carrier",
-                    "lat": pos["lat"],
-                    "lng": pos["lng"],
-                    "heading": None,  # Heading unknown for carriers — OSINT cannot determine true heading
+                    "lat": enriched["lat"],
+                    "lng": enriched["lng"],
+                    "heading": None,  # OSINT cannot determine true heading.
                     "sog": 0,
                     "cog": 0,
                     "country": "United States",
-                    "desc": pos.get("desc", ""),
-                    "wiki": pos.get("wiki", info.get("wiki", "")),
+                    "desc": enriched["desc"],
+                    "wiki": enriched["wiki"],
                     "estimated": True,
-                    "source": pos.get("source", "OSINT estimated position"),
-                    "source_url": pos.get(
-                        "source_url", "https://news.usni.org/category/fleet-tracker"
-                    ),
-                    "last_osint_update": pos.get("updated", ""),
+                    "source": enriched["source"],
+                    "source_url": enriched["source_url"],
+                    "last_osint_update": enriched["last_osint_update"],
+                    # New fields (additive — existing UI continues to work):
+                    "position_source_at": enriched["position_source_at"],
+                    "position_confidence": enriched["position_confidence"],
+                    "is_fallback": enriched["is_fallback"],
                 }
             )
         return _deconflict_positions(result)
 
 
 # -----------------------------------------------------------------
-# Scheduler: runs at startup, then at 00:00 and 12:00 UTC daily
+# Scheduler: runs at startup, then at 00:00 and 12:00 UTC daily.
 # -----------------------------------------------------------------
 _scheduler_thread: Optional[threading.Thread] = None
 _scheduler_stop = threading.Event()
@@ -544,7 +745,6 @@ _scheduler_stop = threading.Event()
 
 def _scheduler_loop():
     """Background thread that triggers updates at 00:00 and 12:00 UTC."""
-    # Initial update on startup
     try:
         update_carrier_positions()
     except Exception as e:
@@ -552,7 +752,6 @@ def _scheduler_loop():
 
     while not _scheduler_stop.is_set():
         now = datetime.now(timezone.utc)
-        # Next target: 00:00 or 12:00 UTC, whichever is sooner
         hour = now.hour
         if hour < 12:
             next_hour = 12
@@ -561,18 +760,17 @@ def _scheduler_loop():
 
         next_run = now.replace(hour=next_hour % 24, minute=0, second=0, microsecond=0)
         if next_hour == 24:
-            from datetime import timedelta
-
             next_run = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
         wait_seconds = (next_run - now).total_seconds()
         logger.info(
-            f"Carrier tracker: next update at {next_run.isoformat()} ({wait_seconds/3600:.1f}h)"
+            "Carrier tracker: next update at %s (%.1fh)",
+            next_run.isoformat(),
+            wait_seconds / 3600,
         )
 
-        # Wait until next scheduled time, or until stop event
         if _scheduler_stop.wait(timeout=wait_seconds):
-            break  # Stop event was set
+            break
 
         try:
             update_carrier_positions()
