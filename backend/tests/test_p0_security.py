@@ -87,16 +87,32 @@ class TestRequireLocalOperator:
         assert self._call_with_host("172.16.0.5") == 403
 
     def test_docker_bridge_blocked_without_compose_opt_in(self):
+        # Even if DNS would resolve the frontend hostname to this IP,
+        # the env opt-in is required.
         with patch.dict("os.environ", {"SHADOWBROKER_TRUST_DOCKER_BRIDGE_LOCAL_OPERATOR": ""}):
-            assert self._call_with_host("172.18.0.3") == 403
+            with patch("auth._resolve_trusted_bridge_ips", return_value=frozenset({"172.18.0.3"})):
+                assert self._call_with_host("172.18.0.3") == 403
 
     def test_docker_bridge_passes_with_compose_opt_in(self):
+        # Issue #250: opt-in alone is no longer sufficient — the source IP
+        # must also reverse-match a trusted frontend container hostname.
+        # Here we simulate Docker DNS resolving "frontend" to 172.18.0.3.
         with patch.dict("os.environ", {"SHADOWBROKER_TRUST_DOCKER_BRIDGE_LOCAL_OPERATOR": "1"}):
-            assert self._call_with_host("172.18.0.3") == 200
+            with patch("auth._resolve_trusted_bridge_ips", return_value=frozenset({"172.18.0.3"})):
+                assert self._call_with_host("172.18.0.3") == 200
+
+    def test_unknown_bridge_ip_blocked_even_with_compose_opt_in(self):
+        # Issue #250 core regression: a rogue container on the same bridge
+        # whose IP is NOT in the resolved frontend hostname set must NOT
+        # be trusted, even when the bridge opt-in flag is on.
+        with patch.dict("os.environ", {"SHADOWBROKER_TRUST_DOCKER_BRIDGE_LOCAL_OPERATOR": "1"}):
+            with patch("auth._resolve_trusted_bridge_ips", return_value=frozenset({"172.18.0.3"})):
+                assert self._call_with_host("172.18.0.99") == 403
 
     def test_lan_ip_still_blocked_with_compose_opt_in(self):
         with patch.dict("os.environ", {"SHADOWBROKER_TRUST_DOCKER_BRIDGE_LOCAL_OPERATOR": "1"}):
-            assert self._call_with_host("192.168.1.100") == 403
+            with patch("auth._resolve_trusted_bridge_ips", return_value=frozenset({"172.18.0.3"})):
+                assert self._call_with_host("192.168.1.100") == 403
 
     def test_rfc1918_192168_blocked_without_key(self):
         assert self._call_with_host("192.168.1.100") == 403

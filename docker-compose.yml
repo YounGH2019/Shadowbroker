@@ -43,6 +43,11 @@ services:
       # The bundled Docker UI talks to the backend across Docker's private bridge.
       # Treat that bridge as local operator access while ports remain bound to 127.0.0.1 by default.
       - SHADOWBROKER_TRUST_DOCKER_BRIDGE_LOCAL_OPERATOR=${SHADOWBROKER_TRUST_DOCKER_BRIDGE_LOCAL_OPERATOR:-1}
+      # Issue #250: bridge trust is now bound to specific container hostnames
+      # (default: 'frontend' compose service + 'shadowbroker-frontend' container
+      # name). If you rename the frontend service or run with a different
+      # container_name, list the hostnames here (comma-separated, no spaces).
+      - SHADOWBROKER_TRUSTED_FRONTEND_HOSTS=${SHADOWBROKER_TRUSTED_FRONTEND_HOSTS:-frontend,shadowbroker-frontend}
     volumes:
       - backend_data:/app/data
     restart: unless-stopped

@@ -245,15 +245,90 @@ def _docker_bridge_local_operator_enabled() -> bool:
     }
 
 
+# Issue #250 (tg12): the previous implementation returned True for any IP
+# in the entire 172.16.0.0/12 range. Anyone with `docker run` access on
+# the same daemon could spin up a container that automatically passed
+# local-operator auth. The fix narrows trust to ONLY connections whose
+# source IP matches the configured frontend container's hostname.
+#
+# Docker DNS resolves both the compose service name (``frontend``) and
+# the explicit ``container_name`` (``shadowbroker-frontend``) to the
+# frontend container's bridge IP. We forward-resolve both, cache the
+# result for 30s, and only trust connections from those exact IPs.
+#
+# Operators on shared Docker hosts get the benefit of the narrower
+# surface. Operators on single-user installs see no behavior change —
+# their frontend container still resolves and is still trusted.
+_DOCKER_BRIDGE_TRUST_CACHE: dict = {"ips": frozenset(), "expires": 0.0}
+_DOCKER_BRIDGE_TRUST_TTL = 30.0
+
+
+def _trusted_bridge_frontend_hostnames() -> list[str]:
+    """Container hostnames whose IPs we treat as local-operator on the bridge.
+
+    Default covers both Docker Compose service name (``frontend``) and the
+    explicit ``container_name`` from the shipped docker-compose.yml
+    (``shadowbroker-frontend``). Operators with non-default names can
+    override via the ``SHADOWBROKER_TRUSTED_FRONTEND_HOSTS`` env var
+    (comma-separated, no spaces).
+    """
+    raw = str(
+        os.environ.get(
+            "SHADOWBROKER_TRUSTED_FRONTEND_HOSTS",
+            "frontend,shadowbroker-frontend",
+        )
+    ).strip()
+    return [h.strip() for h in raw.split(",") if h.strip()]
+
+
+def _resolve_trusted_bridge_ips() -> frozenset[str]:
+    """Resolve trusted frontend hostnames to a set of IPs, with caching.
+
+    Cached for 30s so we don't hit DNS on every request. The cache is
+    process-local — frontend container IP rotations during a backend's
+    lifetime will be picked up within 30s.
+
+    Returns frozenset() if Docker DNS can't resolve any of the configured
+    hostnames (fail-closed — when in doubt, refuse to trust the bridge).
+    """
+    import socket
+    import time as _time
+
+    now = _time.time()
+    cache = _DOCKER_BRIDGE_TRUST_CACHE
+    if cache["expires"] > now:
+        return cache["ips"]
+
+    ips: set[str] = set()
+    for hostname in _trusted_bridge_frontend_hostnames():
+        try:
+            _, _, addrs = socket.gethostbyname_ex(hostname)
+        except (OSError, socket.gaierror):
+            continue
+        for addr in addrs:
+            ips.add(addr)
+
+    resolved = frozenset(ips)
+    cache["ips"] = resolved
+    cache["expires"] = now + _DOCKER_BRIDGE_TRUST_TTL
+    return resolved
+
+
 def _is_docker_bridge_host(host: str) -> bool:
+    """Return True only when the source IP matches our trusted frontend
+    container hostname(s).
+
+    Previously trusted any 172.16.0.0/12 IP unconditionally. See the
+    block comment above for the security rationale.
+    """
     try:
         ip = ipaddress.ip_address(host)
     except ValueError:
         return False
-    # Docker Desktop and the default compose bridge normally sit inside
-    # 172.16.0.0/12. Keep this narrower than "any private IP" so a user who
-    # intentionally binds the backend to LAN does not silently trust LAN clients.
-    return ip in ipaddress.ip_network("172.16.0.0/12")
+    # Public IPs are never our frontend container — skip DNS work for them.
+    if not ip.is_private:
+        return False
+    return host in _resolve_trusted_bridge_ips()
 
 
 def _is_trusted_local_runtime_host(host: str) -> bool:
