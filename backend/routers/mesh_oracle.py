@@ -223,11 +223,21 @@ async def oracle_markets_more(request: Request, category: str = "NEWS", offset: 
             "has_more": offset + limit < len(cat_markets), "total": len(cat_markets)}
 
 
-@router.post("/api/mesh/oracle/resolve")
+@router.post(
+    "/api/mesh/oracle/resolve",
+    dependencies=[Depends(require_admin)],
+)
 @limiter.limit("5/minute")
 @mesh_write_exempt(MeshWriteExemption.ADMIN_CONTROL)
 async def oracle_resolve(request: Request):
-    """Resolve a prediction market."""
+    """Resolve a prediction market.
+
+    Issue #240 (tg12): requires admin authentication. The
+    ``mesh_write_exempt`` decorator below is **metadata only** — it tags
+    the route as not requiring a mesh signed-write envelope, it does
+    NOT itself enforce caller authorization. The ``Depends(require_admin)``
+    on the route decorator is what actually gates access.
+    """
     from services.mesh.mesh_oracle import oracle_ledger
     body = await request.json()
     market_title = body.get("market_title", "")
@@ -327,11 +337,18 @@ async def oracle_predictions(request: Request, node_id: str = ""):
         active_predictions, authenticated=_scoped_view_authenticated(request, "mesh.audit"))
 
 
-@router.post("/api/mesh/oracle/resolve-stakes")
+@router.post(
+    "/api/mesh/oracle/resolve-stakes",
+    dependencies=[Depends(require_admin)],
+)
 @limiter.limit("5/minute")
 @mesh_write_exempt(MeshWriteExemption.ADMIN_CONTROL)
 async def oracle_resolve_stakes(request: Request):
-    """Resolve all expired stake contests."""
+    """Resolve all expired stake contests.
+
+    Issue #241 (tg12): requires admin authentication. See the note on
+    ``oracle_resolve`` above — ``mesh_write_exempt`` is metadata only.
+    """
     from services.mesh.mesh_oracle import oracle_ledger
     resolutions = oracle_ledger.resolve_expired_stakes()
     return {"ok": True, "resolutions": resolutions, "count": len(resolutions)}
