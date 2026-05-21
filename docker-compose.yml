@@ -28,6 +28,15 @@ services:
       - MESH_RELAY_PEERS=${MESH_RELAY_PEERS:-}
       # Shared transport auth for operator peer push. Must be set to a unique secret per deployment.
       - MESH_PEER_PUSH_SECRET=${MESH_PEER_PUSH_SECRET:-}
+      # Issue #256: optional per-peer HMAC secrets. Comma-separated
+      # `url=secret` pairs (no spaces). When a peer URL appears here, only
+      # the listed per-peer secret is accepted for it — the global
+      # MESH_PEER_PUSH_SECRET above is ignored for that specific URL. This
+      # closes the cross-peer impersonation surface for multi-peer fleets.
+      # Single-peer installs leave this empty (default) for unchanged
+      # behavior. Both sides of a peering must agree on the per-peer
+      # secret for a given URL.
+      - MESH_PEER_SECRETS=${MESH_PEER_SECRETS:-}
       # Meshtastic MQTT is opt-in to avoid passive load on the public broker.
       # Set MESH_MQTT_ENABLED=true in .env only when this node should join live MQTT.
       - MESH_MQTT_ENABLED=${MESH_MQTT_ENABLED:-false}

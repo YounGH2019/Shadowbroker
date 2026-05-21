@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     MESH_RELAY_FAILURE_COOLDOWN_S: int = 120
     MESH_BOOTSTRAP_SEED_FAILURE_COOLDOWN_S: int = 15
     MESH_PEER_PUSH_SECRET: str = ""
+    # Issue #256 (tg12): optional per-peer HMAC secret map. Comma-separated
+    # `url=secret` pairs. When a peer URL appears here, only that per-peer
+    # secret is accepted for it — the global MESH_PEER_PUSH_SECRET above is
+    # ignored for that specific URL. Single-peer installs and unmigrated
+    # multi-peer installs leave this empty and behavior is unchanged.
+    MESH_PEER_SECRETS: str = ""
     MESH_RNS_APP_NAME: str = "shadowbroker"
     MESH_RNS_ASPECT: str = "infonet"
     MESH_RNS_IDENTITY_PATH: str = ""

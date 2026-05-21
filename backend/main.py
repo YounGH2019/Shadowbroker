@@ -220,6 +220,7 @@ from services.mesh.mesh_crypto import (
     _derive_peer_key,
     derive_node_id,
     normalize_peer_url,
+    resolve_peer_key_for_url,
     verify_node_binding,
     parse_public_key_algo,
 )
@@ -1745,10 +1746,12 @@ def _http_peer_push_loop() -> None:
                 _NODE_SYNC_STOP.wait(_PEER_PUSH_INTERVAL_S)
                 continue
 
-            secret = str(get_settings().MESH_PEER_PUSH_SECRET or "").strip()
-            if not secret:
-                _NODE_SYNC_STOP.wait(_PEER_PUSH_INTERVAL_S)
-                continue
+            # Issue #256: resolve_peer_key_for_url() handles both the
+            # legacy global MESH_PEER_PUSH_SECRET path and the per-peer
+            # MESH_PEER_SECRETS map. The per-peer skip happens below
+            # ("if not peer_key: continue"), so we don't gate the whole
+            # loop on the global secret being set — an install that only
+            # configures per-peer secrets is now valid.
 
             peers = authenticated_push_peer_urls()
             if not peers:
@@ -1778,7 +1781,7 @@ def _http_peer_push_loop() -> None:
                         ensure_ascii=False,
                     ).encode("utf-8")
 
-                    peer_key = _derive_peer_key(secret, normalized)
+                    peer_key = resolve_peer_key_for_url(normalized)
                     if not peer_key:
                         continue
                     import hmac as _hmac_mod2
@@ -1831,10 +1834,7 @@ def _http_gate_pull_loop() -> None:
                 _NODE_SYNC_STOP.wait(_GATE_PULL_INTERVAL_S)
                 continue
 
-            secret = str(get_settings().MESH_PEER_PUSH_SECRET or "").strip()
-            if not secret:
-                _NODE_SYNC_STOP.wait(_GATE_PULL_INTERVAL_S)
-                continue
+            # Issue #256: per-peer key resolution; see _http_peer_push_loop.
 
             peers = authenticated_push_peer_urls()
             if not peers:
@@ -1846,7 +1846,7 @@ def _http_gate_pull_loop() -> None:
                 if not normalized:
                     continue
 
-                peer_key = _derive_peer_key(secret, normalized)
+                peer_key = resolve_peer_key_for_url(normalized)
                 if not peer_key:
                     continue
 
@@ -1959,10 +1959,7 @@ def _http_gate_push_loop() -> None:
                 _NODE_SYNC_STOP.wait(_PEER_PUSH_INTERVAL_S)
                 continue
 
-            secret = str(get_settings().MESH_PEER_PUSH_SECRET or "").strip()
-            if not secret:
-                _NODE_SYNC_STOP.wait(_PEER_PUSH_INTERVAL_S)
-                continue
+            # Issue #256: per-peer key resolution; see _http_peer_push_loop.
 
             peers = authenticated_push_peer_urls()
             if not peers:
@@ -1977,7 +1974,7 @@ def _http_gate_push_loop() -> None:
                 if not normalized:
                     continue
 
-                peer_key = _derive_peer_key(secret, normalized)
+                peer_key = resolve_peer_key_for_url(normalized)
                 if not peer_key:
                     continue
 

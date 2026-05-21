@@ -26,7 +26,11 @@ from enum import Enum
 from typing import Any, Callable, Optional
 from collections import deque
 from urllib.parse import urlparse
-from services.mesh.mesh_crypto import _derive_peer_key, normalize_peer_url
+from services.mesh.mesh_crypto import (
+    _derive_peer_key,
+    normalize_peer_url,
+    resolve_peer_key_for_url,
+)
 from services.mesh.mesh_metrics import increment as metrics_inc
 from services.mesh.mesh_privacy_policy import (
     TRANSPORT_TIER_ORDER as _TIER_RANK,
@@ -703,7 +707,6 @@ class InternetTransport(_PeerPushTransportMixin):
             endpoint_path, padded = self._build_peer_push_request(envelope, self.NAME)
         except ValueError as exc:
             return TransportResult(False, self.NAME, str(exc))
-        secret = str(settings.MESH_PEER_PUSH_SECRET or "").strip()
 
         delivered = 0
         last_error = ""
@@ -713,10 +716,13 @@ class InternetTransport(_PeerPushTransportMixin):
             try:
                 normalized_peer_url = normalize_peer_url(peer_url)
                 headers = {"Content-Type": "application/json"}
-                if secret:
-                    peer_key = _derive_peer_key(secret, normalized_peer_url)
-                    if not peer_key:
-                        raise ValueError("invalid peer URL for HMAC derivation")
+                # Issue #256: per-peer secret takes precedence over the
+                # global MESH_PEER_PUSH_SECRET. When neither is set the
+                # key is empty and we skip the HMAC header entirely so a
+                # bare (unsigned) push still works on test deployments
+                # that have not yet configured any secret at all.
+                peer_key = resolve_peer_key_for_url(normalized_peer_url)
+                if peer_key:
                     headers["X-Peer-Url"] = normalized_peer_url
                     headers["X-Peer-HMAC"] = hmac.new(
                         peer_key,
@@ -798,7 +804,6 @@ class TorArtiTransport(_PeerPushTransportMixin):
             endpoint_path, padded = self._build_peer_push_request(envelope, self.NAME)
         except ValueError as exc:
             return TransportResult(False, self.NAME, str(exc))
-        secret = str(settings.MESH_PEER_PUSH_SECRET or "").strip()
 
         delivered = 0
         last_error = ""
@@ -808,10 +813,10 @@ class TorArtiTransport(_PeerPushTransportMixin):
             try:
                 normalized_peer_url = normalize_peer_url(peer_url)
                 headers = {"Content-Type": "application/json"}
-                if secret:
-                    peer_key = _derive_peer_key(secret, normalized_peer_url)
-                    if not peer_key:
-                        raise ValueError("invalid peer URL for HMAC derivation")
+                # Issue #256: per-peer secret takes precedence; see the
+                # other transport above for the rationale.
+                peer_key = resolve_peer_key_for_url(normalized_peer_url)
+                if peer_key:
                     headers["X-Peer-Url"] = normalized_peer_url
                     headers["X-Peer-HMAC"] = hmac.new(
                         peer_key,

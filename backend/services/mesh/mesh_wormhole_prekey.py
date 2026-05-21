@@ -91,13 +91,15 @@ def _fetch_dm_prekey_bundle_from_peer_lookup(lookup_token: str) -> dict[str, Any
         return {"ok": False, "detail": "lookup token required"}
     try:
         from services.config import get_settings
-        from services.mesh.mesh_crypto import _derive_peer_key, normalize_peer_url
+        from services.mesh.mesh_crypto import (
+            normalize_peer_url,
+            resolve_peer_key_for_url,
+        )
         from services.mesh.mesh_router import configured_relay_peer_urls
 
         settings = get_settings()
-        secret = str(getattr(settings, "MESH_PEER_PUSH_SECRET", "") or "").strip()
-        if not secret:
-            return {"ok": False, "detail": "peer prekey lookup unavailable"}
+        # Issue #256: secret check moved per-peer below. We still bail out
+        # cleanly when there are no peers configured at all.
         peers = configured_relay_peer_urls()
         if not peers:
             return {"ok": False, "detail": "peer prekey lookup unavailable"}
@@ -121,7 +123,8 @@ def _fetch_dm_prekey_bundle_from_peer_lookup(lookup_token: str) -> dict[str, Any
             or os.environ.get("SB_TEST_NODE_URL", "").strip()
             or normalized_peer_url
         )
-        peer_key = _derive_peer_key(secret, sender_peer_url)
+        # Issue #256: prefer per-peer secret keyed by the sender URL.
+        peer_key = resolve_peer_key_for_url(sender_peer_url)
         if not peer_key:
             continue
         headers = {

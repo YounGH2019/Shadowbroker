@@ -216,18 +216,19 @@ def _peer_pair_ref_key(peer_url: str) -> bytes:
     Returns an empty key on misconfiguration so callers fail closed.
     """
     try:
-        from services.config import get_settings
-        from services.mesh.mesh_crypto import _derive_peer_key, normalize_peer_url
-
-        secret = str(get_settings().MESH_PEER_PUSH_SECRET or "").strip()
+        from services.mesh.mesh_crypto import (
+            normalize_peer_url,
+            resolve_peer_key_for_url,
+        )
     except Exception:
-        return b""
-    if not secret:
         return b""
     normalized = normalize_peer_url(peer_url or "")
     if not normalized:
         return b""
-    peer_key = _derive_peer_key(secret, normalized)
+    # Issue #256: resolve_peer_key_for_url() prefers per-peer secrets
+    # from MESH_PEER_SECRETS and falls back to the global
+    # MESH_PEER_PUSH_SECRET only when the URL has no per-peer entry.
+    peer_key = resolve_peer_key_for_url(normalized)
     if not peer_key:
         return b""
     # Domain-separate from the transport HMAC key so the two

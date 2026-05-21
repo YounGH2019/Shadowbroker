@@ -45,6 +45,7 @@ from services.mesh.mesh_compatibility import (
 from services.mesh.mesh_crypto import (
     _derive_peer_key,
     normalize_peer_url,
+    resolve_peer_key_for_url,
     verify_signature,
     verify_node_binding,
     parse_public_key_algo,
@@ -1403,11 +1404,15 @@ def _peer_hmac_url_from_request(request: Request) -> str:
 
 
 def _verify_peer_push_hmac(request: Request, body_bytes: bytes) -> bool:
-    """Verify HMAC-SHA256 peer authentication on push requests."""
-    secret = str(get_settings().MESH_PEER_PUSH_SECRET or "").strip()
-    if not secret:
-        return False
+    """Verify HMAC-SHA256 peer authentication on push requests.
 
+    Issue #256: ``resolve_peer_key_for_url`` looks up a per-peer secret
+    in ``MESH_PEER_SECRETS`` first, then falls back to the global
+    ``MESH_PEER_PUSH_SECRET``. When a peer URL is listed in the per-peer
+    map, only the listed secret is accepted for it — the global secret
+    is ignored, so any peer that knows only the global secret cannot
+    forge a request claiming to be that peer.
+    """
     provided = str(request.headers.get("x-peer-hmac", "") or "").strip()
     if not provided:
         return False
@@ -1416,7 +1421,7 @@ def _verify_peer_push_hmac(request: Request, body_bytes: bytes) -> bool:
     allowed_peers = set(authenticated_push_peer_urls())
     if not peer_url or peer_url not in allowed_peers:
         return False
-    peer_key = _derive_peer_key(secret, peer_url)
+    peer_key = resolve_peer_key_for_url(peer_url)
     if not peer_key:
         return False
 
