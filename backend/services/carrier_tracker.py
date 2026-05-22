@@ -627,20 +627,56 @@ def update_carrier_positions() -> None:
             _carrier_positions.update(positions)
             _last_update = datetime.now(timezone.utc)
     logger.info(
-        "Carrier tracker: %d carriers loaded from cache (GDELT enrichment starting...)",
+        "Carrier tracker: %d carriers loaded from cache (USNI + GDELT enrichment starting...)",
         len(positions),
     )
 
-    # --- Phase 2: GDELT enrichment ---
+    # --- Phase 2: USNI Fleet & Marine Tracker (PRIMARY source) ---
+    #
+    # USNI publishes a weekly editorial tracker with each carrier's
+    # actual operating area, parsed from explicit prose like
+    #   "The Gerald R. Ford Carrier Strike Group is operating in the Red Sea"
+    # These positions are tagged ``position_confidence: "recent"`` because
+    # they reflect actual reporting, not headline-keyword centroids.
+    # USNI updates are preferred over GDELT — they're authoritative on
+    # US Navy positions where GDELT is just article-title text mining.
+    try:
+        from services.fetchers.usni_fleet_tracker import (
+            fetch_latest_fleet_tracker_positions,
+        )
+        usni_positions = fetch_latest_fleet_tracker_positions()
+        for hull, pos in usni_positions.items():
+            positions[hull] = pos
+            logger.info(
+                "Carrier USNI update: %s → %s",
+                CARRIER_REGISTRY[hull]["name"],
+                pos.get("desc", ""),
+            )
+    except Exception as e:
+        logger.warning("USNI fleet-tracker fetch failed: %s", e)
+
+    # --- Phase 3: GDELT enrichment (SECONDARY — fills gaps) ---
+    #
+    # Used only to backfill carriers USNI didn't mention this week. The
+    # position is stamped ``approximate`` so the UI knows it's a
+    # headline-centroid match (Issue #245).
     try:
         articles = _fetch_gdelt_carrier_news()
         news_positions = _parse_carrier_positions_from_news(articles)
         for hull, pos in news_positions.items():
-            # Always overwrite — newest GDELT mention wins. The previous
-            # entry's position is preserved in git history and the next
-            # cycle either confirms or replaces it.
+            # Only overwrite if the existing entry is NOT a recent USNI
+            # observation. A "recent" USNI position is higher-confidence
+            # than a GDELT headline-centroid match — don't let GDELT
+            # demote a real position to an approximate one.
+            existing = positions.get(hull, {})
+            existing_conf = _compute_position_confidence(existing)
+            if existing_conf == "recent":
+                continue
             positions[hull] = pos
-            logger.info("Carrier OSINT: updated %s from news", CARRIER_REGISTRY[hull]["name"])
+            logger.info(
+                "Carrier OSINT: updated %s from GDELT news",
+                CARRIER_REGISTRY[hull]["name"],
+            )
     except (ValueError, KeyError, json.JSONDecodeError, OSError) as e:
         logger.warning("GDELT carrier fetch failed: %s", e)
 
