@@ -57,6 +57,18 @@ services:
       # name). If you rename the frontend service or run with a different
       # container_name, list the hostnames here (comma-separated, no spaces).
       - SHADOWBROKER_TRUSTED_FRONTEND_HOSTS=${SHADOWBROKER_TRUSTED_FRONTEND_HOSTS:-frontend,shadowbroker-frontend}
+      # Third-party fetcher opt-ins. Default OFF — these phone home to
+      # politically/commercially sensitive upstreams (Polymarket, Kalshi,
+      # Yahoo Finance, EU disinfo trackers, NUFORC dataset host, etc.).
+      # Set to "true" in your .env only if you want the node's IP to
+      # contact each of these services. The dashboard panel for each
+      # feature reads as "no data" until the corresponding flag is on.
+      - PREDICTION_MARKETS_ENABLED=${PREDICTION_MARKETS_ENABLED:-false}
+      - FINANCIAL_ENABLED=${FINANCIAL_ENABLED:-false}
+      - CROWDTHREAT_ENABLED=${CROWDTHREAT_ENABLED:-false}
+      - FIMI_ENABLED=${FIMI_ENABLED:-false}
+      - NUFORC_ENABLED=${NUFORC_ENABLED:-false}
+      - NEWS_ENABLED=${NEWS_ENABLED:-true}
     volumes:
       - backend_data:/app/data
     restart: unless-stopped
