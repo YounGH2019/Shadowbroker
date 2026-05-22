@@ -98,6 +98,88 @@ def _current_etag(prefix: str = "") -> str:
     return f"{prefix}v{get_data_version()}-l{get_active_layers_version()}"
 
 
+# ── Issue #288: viewport-aware payloads ─────────────────────────────────────
+# Heavy, density-driven, time-sensitive layers that benefit from bbox
+# filtering. Light reference layers (datacenters, military_bases,
+# power_plants, satellites, weather, news, etc.) are intentionally NOT
+# in these sets — they ship world-scale even when bounds are supplied so
+# panning never reveals an "empty world" of static infrastructure.
+#
+# When the caller does NOT pass s/w/n/e, none of this runs and the response
+# is byte-for-byte identical to the pre-#288 behavior.
+_FAST_BBOX_HEAVY_KEYS: tuple[str, ...] = (
+    "commercial_flights",
+    "military_flights",
+    "private_flights",
+    "private_jets",
+    "tracked_flights",
+    "ships",
+    "cctv",
+    "uavs",
+    "liveuamap",
+    "gps_jamming",
+    "sigint",
+    "trains",
+)
+_SLOW_BBOX_HEAVY_KEYS: tuple[str, ...] = (
+    "gdelt",
+    "firms_fires",
+    "kiwisdr",
+    "scanners",
+    "psk_reporter",
+)
+
+
+def _has_full_bbox(s, w, n, e) -> bool:
+    return None not in (s, w, n, e)
+
+
+def _bbox_etag_suffix(s, w, n, e) -> str:
+    """Quantize bbox to 1° before mixing into the ETag.
+
+    The 20% padding inside _bbox_filter already absorbs sub-degree pans;
+    quantizing here means small mouse drags don't blow the ETag cache
+    on the client. Full-world bounds collapse to a single suffix.
+    """
+    if not _has_full_bbox(s, w, n, e):
+        return ""
+    try:
+        ss = math.floor(float(s))
+        ww = math.floor(float(w))
+        nn = math.ceil(float(n))
+        ee = math.ceil(float(e))
+    except (TypeError, ValueError):
+        return ""
+    # If the requested window covers basically the whole world, treat it as
+    # "no bbox" for caching purposes so world-zoomed clients all hit the
+    # same ETag and benefit from the existing 304 path.
+    lat_span, lng_span = _bbox_spans(s, w, n, e)
+    if lng_span >= 300 or lat_span >= 120:
+        return ""
+    return f"|bbox={ss},{ww},{nn},{ee}"
+
+
+def _apply_bbox_to_payload(payload: dict, heavy_keys: tuple[str, ...],
+                            s: float, w: float, n: float, e: float) -> dict:
+    """In-place filter the heavy-key collections in *payload* to a viewport.
+
+    Items without lat/lng are passed through (so e.g. summary blobs aren't
+    accidentally dropped). The existing _bbox_filter helper applies a 20%
+    pad and handles antimeridian crossings.
+    """
+    lat_span, lng_span = _bbox_spans(s, w, n, e)
+    # World-scale request → skip filtering entirely. Spares the CPU and
+    # guarantees the response matches the no-params shape.
+    if lng_span >= 300 or lat_span >= 120:
+        return payload
+    for key in heavy_keys:
+        items = payload.get(key)
+        if not isinstance(items, list) or not items:
+            continue
+        payload[key] = _bbox_filter(items, s, w, n, e)
+    return payload
+
+
 def _json_safe(value):
     if isinstance(value, float):
         return value if math.isfinite(value) else None
@@ -479,13 +561,14 @@ async def bootstrap_critical(request: Request):
 @limiter.limit("120/minute")
 async def live_data_fast(
     request: Request,
-    s: float = Query(None, description="South bound (ignored)", ge=-90, le=90),
-    w: float = Query(None, description="West bound (ignored)", ge=-180, le=180),
-    n: float = Query(None, description="North bound (ignored)", ge=-90, le=90),
-    e: float = Query(None, description="East bound (ignored)", ge=-180, le=180),
+    s: float = Query(None, description="South bound — when all four bounds are supplied, heavy/dense layers (vessels, aircraft, sigint, CCTV, …) are filtered to this viewport with 20% padding. Static reference layers (satellites, etc.) always ship world-scale.", ge=-90, le=90),
+    w: float = Query(None, description="West bound (see s)", ge=-180, le=180),
+    n: float = Query(None, description="North bound (see s)", ge=-90, le=90),
+    e: float = Query(None, description="East bound (see s)", ge=-180, le=180),
     initial: bool = Query(False, description="Return a capped startup payload for first paint"),
 ):
-    etag = _current_etag(prefix="fast|initial|" if initial else "fast|full|")
+    bbox_suffix = _bbox_etag_suffix(s, w, n, e)
+    etag = _current_etag(prefix=("fast|initial|" if initial else "fast|full|") + bbox_suffix.lstrip("|") + ("|" if bbox_suffix else ""))
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
     from services.fetchers._store import (active_layers, get_latest_data_subset_refs, get_source_timestamps_snapshot)
@@ -525,6 +608,11 @@ async def live_data_fast(
         payload = _cap_fast_startup_payload(payload)
     else:
         payload = _cap_fast_dashboard_payload(payload)
+    # Issue #288: bbox filter heavy/dense layers only when all four bounds
+    # are supplied. Without bounds, behaviour is byte-for-byte identical
+    # to the pre-#288 implementation.
+    if _has_full_bbox(s, w, n, e):
+        payload = _apply_bbox_to_payload(payload, _FAST_BBOX_HEAVY_KEYS, s, w, n, e)
     return Response(content=orjson.dumps(_sanitize_payload(payload)), media_type="application/json",
         headers={"ETag": etag, "Cache-Control": "no-cache"})
 
@@ -533,12 +621,13 @@ async def live_data_fast(
 @limiter.limit("60/minute")
 async def live_data_slow(
     request: Request,
-    s: float = Query(None, description="South bound (ignored)", ge=-90, le=90),
-    w: float = Query(None, description="West bound (ignored)", ge=-180, le=180),
-    n: float = Query(None, description="North bound (ignored)", ge=-90, le=90),
-    e: float = Query(None, description="East bound (ignored)", ge=-180, le=180),
+    s: float = Query(None, description="South bound — when all four bounds are supplied, heavy/dense layers (gdelt, firms_fires, kiwisdr, scanners, psk_reporter) are filtered to this viewport with 20% padding. Static reference layers (datacenters, military bases, power plants, weather, news, …) always ship world-scale.", ge=-90, le=90),
+    w: float = Query(None, description="West bound (see s)", ge=-180, le=180),
+    n: float = Query(None, description="North bound (see s)", ge=-90, le=90),
+    e: float = Query(None, description="East bound (see s)", ge=-180, le=180),
 ):
-    etag = _current_etag(prefix="slow|full|")
+    bbox_suffix = _bbox_etag_suffix(s, w, n, e)
+    etag = _current_etag(prefix="slow|full|" + bbox_suffix.lstrip("|") + ("|" if bbox_suffix else ""))
     if request.headers.get("if-none-match") == etag:
         return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
     from services.fetchers._store import (active_layers, get_latest_data_subset_refs, get_source_timestamps_snapshot)
@@ -592,6 +681,12 @@ async def live_data_slow(
         "crowdthreat": (d.get("crowdthreat") or []) if active_layers.get("crowdthreat", True) else [],
         "freshness": freshness,
     }
+    # Issue #288: bbox filter heavy/dense layers only when all four bounds
+    # are supplied. Static reference layers (datacenters, military bases,
+    # power_plants, etc.) deliberately stay world-scale so panning never
+    # hides the infrastructure overlay the operator already has on screen.
+    if _has_full_bbox(s, w, n, e):
+        payload = _apply_bbox_to_payload(payload, _SLOW_BBOX_HEAVY_KEYS, s, w, n, e)
     return Response(
         content=orjson.dumps(_sanitize_payload(payload), default=str, option=orjson.OPT_NON_STR_KEYS),
         media_type="application/json",

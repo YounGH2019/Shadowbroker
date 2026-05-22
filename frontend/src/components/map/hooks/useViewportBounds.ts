@@ -8,6 +8,7 @@ import {
   normalizeViewBounds,
   type ViewBounds,
 } from '@/lib/viewportPrivacy';
+import { setLiveDataBounds } from '@/lib/liveDataViewport';
 
 const VIEWPORT_POST_DEBOUNCE_MS = 2500;
 const VIEWPORT_POST_MIN_INTERVAL_MS = 12000;
@@ -69,6 +70,17 @@ export function useViewportBounds(
       lastCommittedBoundsRef.current = preloadBounds;
       window.dispatchEvent(new CustomEvent(VIEWPORT_COMMITTED_EVENT));
     }
+
+    // Issue #288: hand the same coarsened/expanded bounds to the live-data
+    // poller so heavy collections in /api/live-data/{fast,slow} can be
+    // scoped to the visible region. Static reference layers are unaffected
+    // — see backend _FAST_BBOX_HEAVY_KEYS / _SLOW_BBOX_HEAVY_KEYS.
+    setLiveDataBounds({
+      south: preloadBounds.south,
+      west: preloadBounds.west,
+      north: preloadBounds.north,
+      east: preloadBounds.east,
+    });
 
     // Debounce POSTing viewport bounds to backend for dynamic AIS stream filtering
     if (debounceTimerRef.current) clearTimeout(debounceTimerRef.current);

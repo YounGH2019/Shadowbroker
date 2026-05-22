@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { API_BASE } from "@/lib/api";
 import { mergeData, setBackendStatus as setStoreBackendStatus } from "./useDataStore";
+import { appendLiveDataBoundsParams } from "@/lib/liveDataViewport";
 
 export type BackendStatus = 'connecting' | 'connected' | 'disconnected';
 
@@ -32,8 +33,8 @@ export async function forceRefreshLiveData(): Promise<void> {
 
   try {
     const [fastRes, slowRes] = await Promise.all([
-      fetch(`${API_BASE}/api/live-data/fast`),
-      fetch(`${API_BASE}/api/live-data/slow`),
+      fetch(appendLiveDataBoundsParams(`${API_BASE}/api/live-data/fast`)),
+      fetch(appendLiveDataBoundsParams(`${API_BASE}/api/live-data/slow`)),
     ]);
 
     if (fastRes.ok) {
@@ -85,9 +86,13 @@ export const LAYER_TOGGLE_EVENT = 'sb:layer-toggle';
 /**
  * Polls the backend for fast and slow data tiers.
  *
- * All data is fetched globally (no bbox filtering) — the backend returns its
- * full in-memory cache and MapLibre culls off-screen entities on the GPU.
- * This eliminates the "empty map when zooming out" lag.
+ * Issue #288: heavy, density-driven layers (vessels, aircraft, gdelt
+ * events, fires, sigint, …) are bbox-scoped to the visible map area via
+ * `appendLiveDataBoundsParams`. Static reference layers (datacenters,
+ * military bases, power plants, satellites, weather, news, …) are NOT
+ * filtered backend-side, so panning never reveals an "empty world" of
+ * infrastructure. World-zoomed views skip bbox params entirely and hit
+ * the shared ETag cache exactly like the pre-#288 behaviour.
  *
  * The AIS stream viewport POST (/api/viewport) is still handled separately
  * by useViewportBounds to limit upstream AIS ingestion.
@@ -147,7 +152,9 @@ export function useDataPolling() {
         const useStartupPayload = !fetchedStartupFastPayload && !fastEtag.current;
         const headers: Record<string, string> = {};
         if (!useStartupPayload && fastEtag.current) headers['If-None-Match'] = fastEtag.current;
-        const url = `${API_BASE}/api/live-data/fast${useStartupPayload ? '?initial=1' : ''}`;
+        const url = appendLiveDataBoundsParams(
+          `${API_BASE}/api/live-data/fast${useStartupPayload ? '?initial=1' : ''}`,
+        );
         const res = await fetch(url, {
           headers,
           signal: controller.signal,
@@ -193,10 +200,13 @@ export function useDataPolling() {
       try {
         const headers: Record<string, string> = {};
         if (slowEtag.current) headers['If-None-Match'] = slowEtag.current;
-        const res = await fetch(`${API_BASE}/api/live-data/slow`, {
-          headers,
-          signal: controller.signal,
-        });
+        const res = await fetch(
+          appendLiveDataBoundsParams(`${API_BASE}/api/live-data/slow`),
+          {
+            headers,
+            signal: controller.signal,
+          },
+        );
         if (res.status === 304) { scheduleNext('slow'); return; }
         if (res.ok) {
           slowEtag.current = res.headers.get('etag') || null;
