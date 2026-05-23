@@ -46,12 +46,18 @@ function prepareBuildTree() {
   const stagedLayoutPath = path.join(buildFrontendDir, 'src', 'app', 'layout.tsx');
   if (fs.existsSync(stagedLayoutPath)) {
     const layoutSource = fs.readFileSync(stagedLayoutPath, 'utf8');
+    // CRLF compatibility: on Windows checkouts without ``core.autocrlf=input``
+    // (the default) layout.tsx has CRLF line endings, but the original regexes
+    // only matched LF. The strip silently no-op'd, ``force-dynamic`` stayed,
+    // and Next's static-export refused to render ``/_not-found`` ("Page with
+    // `dynamic = \"force-dynamic\"` couldn't be exported"). Use ``\r?\n`` so
+    // the strip works regardless of line-ending normalization.
     fs.writeFileSync(
       stagedLayoutPath,
       layoutSource
-        .replace(/\n\/\/ The dashboard is a live local runtime[\s\S]*?client polling ever hydrates\.\n/g, '\n')
-        .replace(/\nexport const dynamic = ['"]force-dynamic['"];\n/g, '\n')
-        .replace(/\nexport const revalidate = 0;\n/g, '\n'),
+        .replace(/\r?\n\/\/ The dashboard is a live local runtime[\s\S]*?client polling ever hydrates\.\r?\n/g, '\n')
+        .replace(/\r?\nexport const dynamic = ['"]force-dynamic['"];\r?\n/g, '\n')
+        .replace(/\r?\nexport const revalidate = 0;\r?\n/g, '\n'),
     );
   }
 
