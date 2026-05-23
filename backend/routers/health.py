@@ -59,6 +59,12 @@ async def health_check(request: Request):
     # when the SPKI-pinned fallback is in effect. The data plane keeps
     # flowing (this is by design — see ais_proxy.js comments) but observers
     # who care about MITM-protection posture deserve a visible signal.
+    #
+    # Plus connectivity health (added 2026-05-23 when stream.aisstream.io
+    # went fully offline): ``connected`` tells the frontend whether ship
+    # data is actually flowing. When false, a banner explains that ships
+    # are unavailable due to an upstream outage — better than the user
+    # silently seeing an empty ocean and assuming we broke something.
     ais_status: dict = {}
     try:
         from services.ais_stream import ais_proxy_status
@@ -68,6 +74,15 @@ async def health_check(request: Request):
     if ais_status.get("degraded_tls") and top_status == "ok":
         # Don't override a worse top-level status if SLOs already failed,
         # but escalate ok -> degraded so the field surfaces in dashboards.
+        top_status = "degraded"
+    # AIS_API_KEY not configured is "feature off", not "system broken" —
+    # so we only escalate when the operator opted into AIS (key set) AND
+    # the stream is currently offline.
+    if (
+        os.environ.get("AIS_API_KEY")
+        and ais_status.get("connected") is False
+        and top_status == "ok"
+    ):
         top_status = "degraded"
 
     return {

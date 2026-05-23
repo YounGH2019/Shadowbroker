@@ -39,6 +39,7 @@ import { useFeedHealth } from '@/hooks/useFeedHealth';
 import { useKeyboardShortcuts } from '@/hooks/useKeyboardShortcuts';
 import KeyboardShortcutsOverlay from '@/components/KeyboardShortcutsOverlay';
 import AlertToast from '@/components/AlertToast';
+import AisUpstreamBanner from '@/components/AisUpstreamBanner';
 import { useAlertToasts } from '@/hooks/useAlertToasts';
 import { useWatchlist } from '@/hooks/useWatchlist';
 import WatchlistWidget from '@/components/WatchlistWidget';
@@ -932,6 +933,11 @@ export default function Dashboard() {
           onDismiss={dismissToast}
           onFlyTo={handleFlyTo}
         />
+
+        {/* AIS UPSTREAM OUTAGE BANNER — renders only when AIS is configured
+            but the WebSocket upstream is unreachable. Tells users the empty
+            ocean isn't their fault. */}
+        <AisUpstreamBanner />
 
         {/* ONBOARDING MODAL */}
         {showOnboarding && (

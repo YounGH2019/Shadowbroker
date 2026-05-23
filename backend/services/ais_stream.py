@@ -350,19 +350,58 @@ _proxy_process = None
 # path during an upstream cert outage. Surfaced via ais_proxy_status() for
 # /api/health.
 _proxy_status: dict = {}
+# Upstream-connectivity telemetry (added when stream.aisstream.io went fully
+# offline on 2026-05-23). ``_last_msg_at`` is the unix timestamp of the most
+# recent vessel message received from the proxy. ``_proxy_spawn_count`` is
+# how many times we've started the node proxy; combined with no recent
+# messages it tells us the proxy is respawning in a tight loop because the
+# upstream is unreachable. Surfaced via ais_proxy_status() so the operator
+# can see "AIS is dead" instead of guessing whether it's their map filter,
+# their api key, or upstream.
+_last_msg_at: float = 0.0
+_proxy_spawn_count: int = 0
 _VESSEL_TRAIL_INTERVAL_S = 120
 _VESSEL_TRAIL_MAX_POINTS = 240
 
 
-def ais_proxy_status() -> dict:
-    """Return a copy of the latest ais_proxy.js status (issue #258).
+# How stale "last vessel message" can be before we consider the stream
+# disconnected. AISStream typically pushes multiple messages/sec, so a 60s
+# gap means something's wrong upstream or in transit.
+_AIS_CONNECTED_FRESHNESS_S = 60
 
-    Currently surfaces ``degraded_tls`` (bool) which is true when the
-    proxy is using SPKI-pinned fallback because AISStream's cert expired.
-    Returns an empty dict when no status has been received yet.
+
+def ais_proxy_status() -> dict:
+    """Return a copy of the latest ais_proxy.js status + connectivity health.
+
+    Fields:
+      * ``degraded_tls`` (bool, issue #258) — true when the proxy is using
+        SPKI-pinned fallback because AISStream's cert expired.
+      * ``connected`` (bool) — true when we received a vessel message in
+        the last ``_AIS_CONNECTED_FRESHNESS_S`` seconds.
+      * ``last_msg_age_seconds`` (int | None) — seconds since the last
+        vessel message; None if we've never received one.
+      * ``proxy_spawn_count`` (int) — how many times we've spawned the
+        node proxy. Sustained increases here without ``connected`` means
+        we're respawning in a tight loop because upstream is dead.
+
+    Returns an empty dict when called before the AIS subsystem starts
+    (e.g. during tests or when no API key is set).
     """
     with _vessels_lock:
-        return dict(_proxy_status)
+        status = dict(_proxy_status)
+        last = _last_msg_at
+        spawns = _proxy_spawn_count
+
+    now = time.time()
+    if last > 0:
+        last_age = int(now - last)
+        status["last_msg_age_seconds"] = last_age
+        status["connected"] = last_age <= _AIS_CONNECTED_FRESHNESS_S
+    else:
+        status["last_msg_age_seconds"] = None
+        status["connected"] = False
+    status["proxy_spawn_count"] = spawns
+    return status
 
 import os
 
@@ -588,8 +627,10 @@ def _ais_stream_loop():
                 env=proxy_env,
                 **popen_kwargs,
             )
+            global _proxy_spawn_count
             with _vessels_lock:
                 _proxy_process = process
+                _proxy_spawn_count += 1
 
             # Drain stderr in a background thread to prevent deadlock
             import threading
@@ -645,9 +686,15 @@ def _ais_stream_loop():
                 if not mmsi:
                     continue
 
+                # Telemetry: stamp the timestamp of the most recent real
+                # vessel message. ais_proxy_status() reads this to decide
+                # whether the stream is currently "connected" — i.e. has
+                # any data flowed in the last 60s.
+                global _last_msg_at
                 with _vessels_lock:
+                    _last_msg_at = time.time()
                     if mmsi not in _vessels:
-                        _vessels[mmsi] = {"_updated": time.time()}
+                        _vessels[mmsi] = {"_updated": _last_msg_at}
                     vessel = _vessels[mmsi]
 
                 # Update position from PositionReport or StandardClassBPositionReport
