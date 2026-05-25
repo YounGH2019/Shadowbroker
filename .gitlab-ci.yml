@@ -13,6 +13,10 @@
 #   2. Reverse-mirrors main back to GitHub (only if commits land directly
 #      on GitLab) so the two sources stay in sync.
 #
+# Pipelines on this repo were instant-failing for free-tier accounts until
+# identity verification was added — the May 2026 bump in this comment is
+# the marker commit that confirms runner allocation after verification.
+#
 # Auth notes:
 #   - The image build/push uses $CI_JOB_TOKEN, which GitLab provides
 #     automatically. No credentials need to be configured.
