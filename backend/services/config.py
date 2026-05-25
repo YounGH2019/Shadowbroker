@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     MESH_ARTI_ENABLED: bool = False
     MESH_ARTI_SOCKS_PORT: int = 9050
     MESH_RELAY_PEERS: str = ""
+    MESH_PUBLIC_PEER_URL: str = ""
     # Bootstrap seeds are discovery hints, not authoritative network roots.
     # Nodes promote healthy discovered peers from the store/manifest over time.
     MESH_BOOTSTRAP_SEED_PEERS: str = "http://gqpbunqbgtkcqilvclm3xrkt3zowjyl3s62kkktvojgvxzizamvbrqid.onion:8000"

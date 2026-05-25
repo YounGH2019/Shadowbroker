@@ -66,6 +66,20 @@ def _make_gate_message_event(priv, pub_b64, node_id, sequence, prev_hash, gate_i
     return evt.to_dict()
 
 
+def _make_gate_payload(gate_id="test-gate") -> dict:
+    return mesh_protocol.normalize_payload(
+        "gate_message",
+        {
+            "gate": gate_id,
+            "ciphertext": base64.b64encode(b"encrypted-data").decode(),
+            "nonce": base64.b64encode(b"nonce-value-1234").decode(),
+            "sender_ref": "sender-abc",
+            "format": "mls1",
+            "transport_lock": "private_strong",
+        },
+    )
+
+
 @pytest.fixture()
 def fresh_env(tmp_path, monkeypatch):
     """Set up isolated infonet + gate_store, return (infonet, gate_store)."""
@@ -87,6 +101,74 @@ def fresh_env(tmp_path, monkeypatch):
 
 
 # ── Rejected gate_message must NOT hydrate gate_store ─────────────────────
+
+
+def test_append_private_gate_message_uses_hashchain_gate_sequence(fresh_env):
+    """Local gate posts become private hashchain events in a gate sequence domain."""
+    inf, _gs = fresh_env
+    priv, pub_b64, node_id = _make_keypair()
+    sequence = 1
+    payload = _make_gate_payload("test-gate")
+    sig_payload = mesh_crypto.build_signature_payload(
+        event_type="gate_message",
+        node_id=node_id,
+        sequence=sequence,
+        payload=payload,
+    )
+    signature = priv.sign(sig_payload.encode("utf-8")).hex()
+
+    event = inf.append_private_gate_message(
+        node_id=node_id,
+        payload=payload,
+        signature=signature,
+        sequence=sequence,
+        public_key=pub_b64,
+        public_key_algo="Ed25519",
+        protocol_version=mesh_protocol.PROTOCOL_VERSION,
+        timestamp=123.0,
+    )
+
+    assert event["event_type"] == "gate_message"
+    assert inf.head_hash == event["event_id"]
+    assert inf.sequence_domains[f"{node_id}|gate_message"] == sequence
+    assert inf.node_sequences.get(node_id, 0) == 0
+    assert event["payload"]["transport_lock"] == "private_strong"
+
+
+def test_ingest_accepts_new_suffix_after_duplicate_prefix(fresh_env):
+    """Peer-push batches may include events the receiver already has."""
+    inf, _gs = fresh_env
+    priv, pub_b64, node_id = _make_keypair()
+    evt1 = _make_gate_message_event(
+        priv,
+        pub_b64,
+        node_id,
+        sequence=1,
+        prev_hash=mesh_hashchain.GENESIS_HASH,
+    )
+    assert inf.ingest_events([evt1])["accepted"] == 1
+    evt2 = _make_gate_message_event(
+        priv,
+        pub_b64,
+        node_id,
+        sequence=2,
+        prev_hash=evt1["event_id"],
+    )
+    assert inf.ingest_events([evt2])["accepted"] == 1
+    evt3 = _make_gate_message_event(
+        priv,
+        pub_b64,
+        node_id,
+        sequence=3,
+        prev_hash=evt2["event_id"],
+    )
+
+    result = inf.ingest_events([evt1, evt2, evt3])
+
+    assert result["duplicates"] == 2
+    assert result["accepted"] == 1
+    assert result["rejected"] == []
+    assert inf.head_hash == evt3["event_id"]
 
 
 def test_rejected_event_does_not_hydrate_gate_store(fresh_env):

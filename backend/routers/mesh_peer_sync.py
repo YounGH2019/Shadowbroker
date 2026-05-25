@@ -55,6 +55,12 @@ def _hydrate_gate_store_from_chain(events: list) -> int:
     return count
 
 
+def _hydrate_dm_relay_from_chain(events: list) -> int:
+    import main as _m
+
+    return int(_m._hydrate_dm_relay_from_chain(events))
+
+
 @router.post("/api/mesh/infonet/peer-push")
 @limiter.limit("30/minute")
 async def infonet_peer_push(request: Request):
@@ -82,6 +88,7 @@ async def infonet_peer_push(request: Request):
         return {"ok": True, "accepted": 0, "duplicates": 0, "rejected": []}
     result = infonet.ingest_events(events)
     _hydrate_gate_store_from_chain(events)
+    _hydrate_dm_relay_from_chain(events)
     return {"ok": True, **result}
 
 

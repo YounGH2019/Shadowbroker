@@ -298,6 +298,33 @@ export default function InfonetShell({
     setCurrentView(view);
   };
 
+  const renderGateDirectory = (variant: 'landing' | 'command' = 'command') => (
+    <div
+      className={
+        variant === 'landing'
+          ? 'w-full max-w-3xl border border-cyan-950/50 bg-black/20 px-4 py-3 text-left shadow-[0_0_18px_rgba(6,182,212,0.06)]'
+          : 'text-gray-400'
+      }
+    >
+      <p className={`${variant === 'landing' ? 'text-[11px]' : ''} text-gray-400 uppercase tracking-[0.18em]`}>
+        AVAILABLE OBFUSCATED GATES:
+      </p>
+      <div className={`grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 ${variant === 'landing' ? 'gap-x-8 gap-y-1.5 mt-2' : 'gap-2 mt-2'}`}>
+        {GATES.map(gate => (
+          <button
+            key={gate}
+            type="button"
+            className="group flex min-h-[24px] items-center text-left text-gray-300 hover:text-white transition-colors"
+            onClick={() => handleNavigate('gate', gate)}
+          >
+            <span className="text-gray-500 mr-2 group-hover:text-cyan-400 transition-colors">[{'>'}]</span>
+            <span className="truncate group-hover:drop-shadow-[0_0_5px_rgba(6,182,212,0.8)]">{gate}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
   const openGateWhenReady = async (
     gateTarget: string,
     operation: () => Promise<void>,
@@ -471,19 +498,7 @@ export default function InfonetShell({
       setHistory([]);
       return;
     } else if (trimmedCmd === 'gates') {
-      output = (
-        <div className="text-gray-400">
-          <p>AVAILABLE OBFUSCATED GATES:</p>
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-2 mt-2">
-            {GATES.map(gate => (
-              <div key={gate} className="flex items-center cursor-pointer hover:text-gray-300 group" onClick={() => handleNavigate('gate', gate)}>
-                <span className="text-gray-500 mr-2 group-hover:text-cyan-400 transition-colors">[{'>'}]</span>
-                <span className="text-gray-300 group-hover:text-white transition-colors group-hover:drop-shadow-[0_0_5px_rgba(6,182,212,0.8)]">{gate}</span>
-              </div>
-            ))}
-          </div>
-        </div>
-      );
+      output = renderGateDirectory('command');
     } else if (trimmedCmd.startsWith('join ') || trimmedCmd.startsWith('g/')) {
       const target = trimmedCmd.startsWith('g/') ? trimmedCmd.slice(2) : trimmedCmd.split(' ')[1];
       if (GATES.includes(target)) {
@@ -661,6 +676,9 @@ export default function InfonetShell({
                   <p>Type <span className="text-green-400 font-bold">&apos;gates&apos;</span> or <span className="text-green-400 font-bold">g/</span> to view available chatrooms.</p>
                 </div>
                 <NetworkStats />
+                <div className="mt-5 w-full flex justify-center">
+                  {renderGateDirectory('landing')}
+                </div>
               </div>
 
               <HashchainEvents />

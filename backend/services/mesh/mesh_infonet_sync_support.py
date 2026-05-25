@@ -276,5 +276,6 @@ def should_run_sync(
 ) -> bool:
     current_time = int(now if now is not None else time.time())
     if state.last_outcome == "running":
-        return False
+        started_at = int(state.last_sync_started_at or 0)
+        return started_at <= 0 or current_time - started_at >= 300
     return int(state.next_sync_due_at or 0) <= current_time

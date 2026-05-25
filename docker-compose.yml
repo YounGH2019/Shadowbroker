@@ -24,8 +24,16 @@ services:
       # Private Infonet bootstrap seeds. Seeds are discovery hints, not fixed roots.
       - MESH_BOOTSTRAP_SEED_PEERS=${MESH_BOOTSTRAP_SEED_PEERS:-http://gqpbunqbgtkcqilvclm3xrkt3zowjyl3s62kkktvojgvxzizamvbrqid.onion:8000}
       - MESH_DEFAULT_SYNC_PEERS=${MESH_DEFAULT_SYNC_PEERS:-}
+      - MESH_SYNC_TIMEOUT_S=${MESH_SYNC_TIMEOUT_S:-5}
+      - MESH_RELAY_PUSH_TIMEOUT_S=${MESH_RELAY_PUSH_TIMEOUT_S:-45}
+      # Explicitly opt into HTTPS/IP-based peer sync. Default remains private transports only.
+      - MESH_INFONET_ALLOW_CLEARNET_SYNC=${MESH_INFONET_ALLOW_CLEARNET_SYNC:-false}
+      # Tor/Arti SOCKS transport for private .onion Infonet sync.
+      - MESH_ARTI_ENABLED=${MESH_ARTI_ENABLED:-false}
+      - MESH_ARTI_SOCKS_PORT=${MESH_ARTI_SOCKS_PORT:-9050}
       # Operator-trusted sync/push peers. Leave empty unless you control the peer secret on both sides.
       - MESH_RELAY_PEERS=${MESH_RELAY_PEERS:-}
+      - MESH_PUBLIC_PEER_URL=${MESH_PUBLIC_PEER_URL:-}
       # Shared transport auth for operator peer push. Must be set to a unique secret per deployment.
       - MESH_PEER_PUSH_SECRET=${MESH_PEER_PUSH_SECRET:-}
       # Issue #256: optional per-peer HMAC secrets. Comma-separated

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
+import math
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -30,6 +33,58 @@ def _require_fields(payload: dict[str, Any], fields: tuple[str, ...]) -> tuple[b
     for key in fields:
         if key not in payload:
             return False, f"Missing field: {key}"
+    return True, "ok"
+
+
+def _decode_base64ish(value: Any) -> bytes | None:
+    raw = str(value or "").strip()
+    if not raw or any(ch.isspace() for ch in raw):
+        return None
+    padded = raw + ("=" * (-len(raw) % 4))
+    for altchars in (None, b"-_"):
+        try:
+            return base64.b64decode(padded.encode("ascii"), altchars=altchars, validate=True)
+        except (binascii.Error, UnicodeEncodeError, ValueError):
+            continue
+    return None
+
+
+def _byte_entropy(data: bytes) -> float:
+    if not data:
+        return 0.0
+    counts = [0] * 256
+    for byte in data:
+        counts[byte] += 1
+    total = float(len(data))
+    return -sum((count / total) * math.log2(count / total) for count in counts if count)
+
+
+def _validate_sealed_bytes_field(
+    payload: dict[str, Any],
+    field: str,
+    *,
+    min_bytes: int = 8,
+    entropy_floor: float = 2.5,
+) -> tuple[bool, str]:
+    data = _decode_base64ish(payload.get(field, ""))
+    if data is None:
+        return False, f"{field} must be base64-encoded sealed bytes"
+    if len(data) < min_bytes:
+        return False, f"{field} is too short"
+
+    # Short test vectors and compact envelopes can be low entropy; only apply
+    # heuristics once there is enough material to distinguish a sealed blob
+    # from accidental base64-encoded plaintext.
+    if len(data) >= 32:
+        printable = sum(1 for byte in data if 32 <= byte <= 126 or byte in (9, 10, 13))
+        if printable / len(data) > 0.9:
+            try:
+                data.decode("utf-8")
+                return False, f"{field} looks like encoded plaintext"
+            except UnicodeDecodeError:
+                pass
+        if _byte_entropy(data) < entropy_floor:
+            return False, f"{field} entropy is too low for sealed bytes"
     return True, "ok"
 
 
@@ -331,6 +386,7 @@ ACTIVE_PUBLIC_LEDGER_EVENT_TYPES: frozenset[str] = frozenset(
 LEGACY_PUBLIC_LEDGER_EVENT_TYPES: frozenset[str] = frozenset(
     {
         "gate_message",
+        "dm_message",
     }
 )
 """Event types that exist historically on the public chain and must remain
@@ -425,6 +481,8 @@ def validate_event_payload(event_type: str, payload: dict[str, Any]) -> tuple[bo
 
 
 def validate_public_ledger_payload(event_type: str, payload: dict[str, Any]) -> tuple[bool, str]:
+    if event_type == "gate_message":
+        return validate_private_gate_ledger_payload(payload)
     if event_type not in PUBLIC_LEDGER_EVENT_TYPES and event_type not in _EXTENSION_VALIDATORS:
         return False, f"{event_type} is not allowed on the public ledger"
     forbidden = sorted(
@@ -438,6 +496,92 @@ def validate_public_ledger_payload(event_type: str, payload: dict[str, Any]) -> 
         destination = str(payload.get("destination", "") or "").strip().lower()
         if destination and destination != "broadcast":
             return False, "public ledger message destination must be broadcast"
+    return True, "ok"
+
+
+_PRIVATE_GATE_LEDGER_ALLOWED_FIELDS: frozenset[str] = frozenset(
+    {
+        "gate",
+        "ciphertext",
+        "nonce",
+        "sender_ref",
+        "format",
+        "epoch",
+        "gate_envelope",
+        "envelope_hash",
+        "reply_to",
+        "transport_lock",
+        "signed_context",
+    }
+)
+
+
+def validate_private_gate_ledger_payload(payload: dict[str, Any]) -> tuple[bool, str]:
+    """Validate ciphertext-only gate events for private Infonet replication."""
+    ok, reason = validate_event_payload("gate_message", payload)
+    if not ok:
+        return ok, reason
+    unexpected = sorted(
+        key
+        for key in payload.keys()
+        if str(key or "").strip().lower() not in _PRIVATE_GATE_LEDGER_ALLOWED_FIELDS
+    )
+    if unexpected:
+        return False, f"private gate ledger payload contains unsupported fields: {', '.join(unexpected)}"
+    if "message" in payload or "_local_plaintext" in payload or "_local_reply_to" in payload:
+        return False, "private gate ledger payload must not contain plaintext"
+    transport_lock = str(payload.get("transport_lock", "") or "").strip().lower()
+    if transport_lock and transport_lock not in {"private", "private_strong", "rns", "onion"}:
+        return False, "gate messages require private transport_lock"
+    ok, reason = _validate_sealed_bytes_field(payload, "ciphertext")
+    if not ok:
+        return ok, reason
+    ok, reason = _validate_sealed_bytes_field(payload, "nonce")
+    if not ok:
+        return ok, reason
+    return True, "ok"
+
+
+_PRIVATE_DM_LEDGER_ALLOWED_FIELDS: frozenset[str] = frozenset(
+    {
+        "recipient_id",
+        "delivery_class",
+        "recipient_token",
+        "ciphertext",
+        "msg_id",
+        "timestamp",
+        "format",
+        "session_welcome",
+        "sender_seal",
+        "relay_salt",
+        "transport_lock",
+        "signed_context",
+    }
+)
+
+
+def validate_private_dm_ledger_payload(payload: dict[str, Any]) -> tuple[bool, str]:
+    """Validate ciphertext-only DM dead-drop events for private Infonet replication."""
+    ok, reason = validate_event_payload("dm_message", payload)
+    if not ok:
+        return ok, reason
+    unexpected = sorted(
+        key
+        for key in payload.keys()
+        if str(key or "").strip().lower() not in _PRIVATE_DM_LEDGER_ALLOWED_FIELDS
+    )
+    if unexpected:
+        return False, f"private DM ledger payload contains unsupported fields: {', '.join(unexpected)}"
+    if "message" in payload or "plaintext" in payload or "_local_plaintext" in payload:
+        return False, "private DM ledger payload must not contain plaintext"
+    transport_lock = str(payload.get("transport_lock", "") or "").strip().lower()
+    if transport_lock != "private_strong":
+        return False, "DM hashchain spool requires private_strong transport_lock"
+    if not str(payload.get("ciphertext", "") or "").strip():
+        return False, "ciphertext cannot be empty"
+    ok, reason = _validate_sealed_bytes_field(payload, "ciphertext")
+    if not ok:
+        return ok, reason
     return True, "ok"
 
 

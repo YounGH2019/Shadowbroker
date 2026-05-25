@@ -8,6 +8,7 @@ echo ===================================================
 echo.
 echo   Lightweight node — syncs the Infonet chain only.
 echo   No map, no frontend, no data feeds.
+echo   Private hashchain relay: gate messages + offline DM spool.
 echo   Close this window to stop the node.
 echo.
 
@@ -96,15 +97,22 @@ echo [*] Auto-enabling node participation...
 if not exist "data\" mkdir data
 echo {"enabled":true,"updated_at":0} > data\node.json
 
+set MESH_ONLY=true
+set SHADOWBROKER_MESH_NODE_RUNTIME=true
+set MESH_NODE_MODE=participant
+set MESH_INFONET_ALLOW_CLEARNET_SYNC=false
+set MESH_ARTI_ENABLED=true
+set MESH_DM_HASHCHAIN_SPOOL_LIMIT=2
+set MESH_DM_HASHCHAIN_SPOOL_TTL_S=3600
+if "%MESH_BOOTSTRAP_SEED_PEERS%"=="" set MESH_BOOTSTRAP_SEED_PEERS=http://gqpbunqbgtkcqilvclm3xrkt3zowjyl3s62kkktvojgvxzizamvbrqid.onion:8000
+
 echo.
 echo ===================================================
 echo   Mesh node starting on port 8000
 echo   Mode: MESH_ONLY (no data feeds)
-echo   Relay: %MESH_RELAY_PEERS%
+echo   Bootstrap: %MESH_BOOTSTRAP_SEED_PEERS%
 echo   Press Ctrl+C to stop
 echo ===================================================
 echo.
 
-set MESH_ONLY=true
-set MESH_NODE_MODE=participant
 python -m uvicorn main:app --host 0.0.0.0 --port 8000

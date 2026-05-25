@@ -87,10 +87,27 @@ def _run_gate_release_once(monkeypatch, *, transport_tier="private_strong"):
 def _patch_for_successful_post(monkeypatch, module):
     """Apply standard monkeypatches so a gate_message post succeeds."""
     import main
+    from services.mesh import mesh_hashchain
 
     _setup_gate_outbox(monkeypatch)
     monkeypatch.setattr(main, "_verify_gate_message_signed_write", lambda **kw: (True, "ok", kw.get("reply_to", "")))
     monkeypatch.setattr(main, "_resolve_envelope_policy", lambda _gate_id: "envelope_disabled")
+
+    def _fake_private_gate_append(**kwargs):
+        return {
+            "event_id": f"ledger-ev-{kwargs.get('sequence', 0)}",
+            "event_type": "gate_message",
+            "node_id": kwargs["node_id"],
+            "payload": dict(kwargs["payload"]),
+            "timestamp": kwargs.get("timestamp", 0) or 123.0,
+            "sequence": kwargs["sequence"],
+            "signature": kwargs["signature"],
+            "public_key": kwargs["public_key"],
+            "public_key_algo": kwargs["public_key_algo"],
+            "protocol_version": kwargs.get("protocol_version", "infonet/2"),
+        }
+
+    monkeypatch.setattr(mesh_hashchain.infonet, "append_private_gate_message", _fake_private_gate_append)
 
     from services.mesh.mesh_reputation import gate_manager, reputation_ledger
 
@@ -255,19 +272,30 @@ def test_gate_post_preserves_gate_envelope_in_store(monkeypatch):
 
 
 def test_gate_post_advances_sequence(monkeypatch):
-    """validate_and_set_sequence must be called to advance the counter."""
+    """append_private_gate_message must receive the gate sequence."""
     import main
     from services.mesh import mesh_hashchain
 
     _patch_for_successful_post(monkeypatch, main)
 
-    seq_calls = []
+    append_calls = []
 
-    def track_seq(node_id, seq, *, domain=""):
-        seq_calls.append((node_id, seq, domain))
-        return (True, "ok")
+    def track_private_append(**kwargs):
+        append_calls.append(kwargs)
+        return {
+            "event_id": "ev-seq",
+            "event_type": "gate_message",
+            "node_id": kwargs["node_id"],
+            "payload": dict(kwargs["payload"]),
+            "timestamp": kwargs.get("timestamp", 0) or 123.0,
+            "sequence": kwargs["sequence"],
+            "signature": kwargs["signature"],
+            "public_key": kwargs["public_key"],
+            "public_key_algo": kwargs["public_key_algo"],
+            "protocol_version": kwargs.get("protocol_version", "infonet/2"),
+        }
 
-    monkeypatch.setattr(mesh_hashchain.infonet, "validate_and_set_sequence", track_seq)
+    monkeypatch.setattr(mesh_hashchain.infonet, "append_private_gate_message", track_private_append)
     monkeypatch.setattr(
         mesh_hashchain.gate_store,
         "append",
@@ -280,8 +308,9 @@ def test_gate_post_advances_sequence(monkeypatch):
 
     assert result["ok"] is True
     assert result["queued"] is True
-    assert len(seq_calls) == 1
-    assert seq_calls[0] == ("!sb_test1234567890", 42, "gate_message")
+    assert len(append_calls) == 1
+    assert append_calls[0]["node_id"] == "!sb_test1234567890"
+    assert append_calls[0]["sequence"] == 42
 
 
 def test_gate_post_rejects_replay_via_sequence(monkeypatch):
@@ -290,11 +319,11 @@ def test_gate_post_rejects_replay_via_sequence(monkeypatch):
     from services.mesh import mesh_hashchain
 
     _patch_for_successful_post(monkeypatch, main)
-    monkeypatch.setattr(
-        mesh_hashchain.infonet,
-        "validate_and_set_sequence",
-        lambda node_id, seq: (False, "Replay detected: sequence 1 <= last 1"),
-    )
+
+    def reject_private_append(**_kwargs):
+        raise ValueError("Replay detected: sequence 1 <= last 1")
+
+    monkeypatch.setattr(mesh_hashchain.infonet, "append_private_gate_message", reject_private_append)
 
     gate_id = "infonet"
     body = _build_gate_message_body(gate_id, sequence=1)

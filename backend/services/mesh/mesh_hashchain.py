@@ -33,8 +33,9 @@ Each event contains:
 
 Persistence: JSON file at backend/data/infonet.json
 
-Encrypted gate chat events are intentionally kept off the public chain and
-persisted separately via GateMessageStore.
+Encrypted gate chat events are private-chain ciphertext records. They are
+excluded from public read surfaces and replicated only over private Infonet
+transports.
 """
 
 import json
@@ -64,6 +65,8 @@ from services.mesh.mesh_schema import (
     ACTIVE_PUBLIC_LEDGER_EVENT_TYPES,
     PUBLIC_LEDGER_EVENT_TYPES,
     validate_event_payload,
+    validate_private_dm_ledger_payload,
+    validate_private_gate_ledger_payload,
     validate_protocol_fields,
     validate_public_ledger_payload,
 )
@@ -127,6 +130,12 @@ GATE_SEGMENT_MAX_COMPRESSED_BYTES = max(
     int(os.environ.get("MESH_GATE_SEGMENT_MAX_COMPRESSED_BYTES", str(2 * 1024 * 1024)) or str(2 * 1024 * 1024)),
 )
 GATE_SEGMENT_STORAGE_VERSION = 1
+DM_HASHCHAIN_SPOOL_LIMIT = max(1, int(os.environ.get("MESH_DM_HASHCHAIN_SPOOL_LIMIT", "2") or "2"))
+DM_HASHCHAIN_SPOOL_SENDER_LIMIT = max(
+    1,
+    int(os.environ.get("MESH_DM_HASHCHAIN_SPOOL_SENDER_LIMIT", "1") or "1"),
+)
+DM_HASHCHAIN_SPOOL_TTL_S = max(60, int(os.environ.get("MESH_DM_HASHCHAIN_SPOOL_TTL_S", "3600") or "3600"))
 _PUBLIC_EVENT_APPEND_HOOKS: list[Any] = []
 _PUBLIC_EVENT_APPEND_HOOKS_LOCK = threading.Lock()
 
@@ -338,6 +347,32 @@ def _private_gate_event_id(
     return hashlib.sha256(
         f"{gate_id}:{node_id}:{payload_json}:{timestamp}:{int(sequence)}".encode("utf-8")
     ).hexdigest()
+
+
+def _private_gate_signature_payload_variants(gate_id: str, event: dict[str, Any]) -> list[dict[str, Any]]:
+    payload = _private_gate_signature_payload(gate_id, event)
+    variants: list[dict[str, Any]] = [payload]
+    event_payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+    reply_to = str(event_payload.get("reply_to", "") or "").strip()
+    if reply_to:
+        variants.append(_private_gate_signature_payload(gate_id, event, include_reply_to=False))
+    if "epoch" in payload:
+        no_epoch = dict(payload)
+        no_epoch.pop("epoch", None)
+        variants.append(no_epoch)
+        if reply_to:
+            no_epoch_no_reply = _private_gate_signature_payload(gate_id, event, include_reply_to=False)
+            no_epoch_no_reply.pop("epoch", None)
+            variants.append(no_epoch_no_reply)
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for variant in variants:
+        material = json.dumps(variant, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if material in seen:
+            continue
+        seen.add(material)
+        deduped.append(variant)
+    return deduped
 
 
 def _sanitize_private_gate_event(gate_id: str, event: dict[str, Any]) -> dict[str, Any]:
@@ -1568,11 +1603,18 @@ class Infonet:
     def _rebuild_state(self) -> None:
         self.event_index = {}
         self.node_sequences = {}
-        # Keep private signed-write replay domains across public-chain
-        # rebuilds; these domains protect local side effects that are not
-        # represented as public Infonet events.
-        if not isinstance(getattr(self, "sequence_domains", None), dict):
-            self.sequence_domains = {}
+        # Keep private signed-write replay domains that are not represented
+        # on-chain, but rebuild the gate_message sequence domain from chain
+        # events so reloads/fork application do not mix it with public
+        # per-node message sequences.
+        preserved_domains = {}
+        if isinstance(getattr(self, "sequence_domains", None), dict):
+            preserved_domains = {
+                key: value
+                for key, value in self.sequence_domains.items()
+                if not str(key or "").endswith("|gate_message")
+            }
+        self.sequence_domains = dict(preserved_domains)
         self.public_key_bindings = {}
         self.revocations = {}
         self._replay_filter = ReplayFilter()
@@ -1584,9 +1626,12 @@ class Infonet:
             node_id = evt.get("node_id", "")
             sequence = _safe_int(evt.get("sequence", 0) or 0, 0)
             if node_id and sequence:
-                last = self.node_sequences.get(node_id, 0)
+                sequence_table, sequence_key = self._sequence_table_for_event(
+                    evt.get("event_type", ""), node_id
+                )
+                last = sequence_table.get(sequence_key, 0)
                 if sequence > last:
-                    self.node_sequences[node_id] = sequence
+                    sequence_table[sequence_key] = sequence
             public_key = str(evt.get("public_key", "") or "")
             if public_key and node_id:
                 existing = self.public_key_bindings.get(public_key)
@@ -1898,6 +1943,295 @@ class Infonet:
         self._save()
         return True, "ok"
 
+    def _sequence_table_for_event(self, event_type: str, node_id: str) -> tuple[dict[str, int], str]:
+        normalized = str(event_type or "").strip().lower()
+        if normalized == "gate_message":
+            return self.sequence_domains, f"{node_id}|gate_message"
+        if normalized == "dm_message":
+            return self.sequence_domains, f"{node_id}|dm_message"
+        return self.node_sequences, node_id
+
+    def _dm_spool_target_key(self, payload: dict[str, Any]) -> tuple[str, str]:
+        delivery_class = str(payload.get("delivery_class", "") or "").strip().lower()
+        if delivery_class == "shared":
+            key = str(payload.get("recipient_token", "") or "").strip()
+        else:
+            key = str(payload.get("recipient_id", "") or "").strip()
+        return delivery_class, key
+
+    def _dm_spool_active_counts(
+        self,
+        payload: dict[str, Any],
+        *,
+        sender_id: str = "",
+        now: float | None = None,
+    ) -> tuple[int, int]:
+        delivery_class, key = self._dm_spool_target_key(payload)
+        if not key:
+            return 0, 0
+        sender_id = str(sender_id or "").strip()
+        current = time.time() if now is None else float(now)
+        total_count = 0
+        sender_count = 0
+        for evt in reversed(self.events):
+            if evt.get("event_type") != "dm_message":
+                continue
+            evt_payload = evt.get("payload") if isinstance(evt.get("payload"), dict) else {}
+            evt_delivery_class, evt_key = self._dm_spool_target_key(evt_payload)
+            if evt_delivery_class != delivery_class:
+                continue
+            if evt_key != key:
+                continue
+            evt_ts = float(evt_payload.get("timestamp", evt.get("timestamp", 0)) or 0)
+            if evt_ts > 0 and current - evt_ts > DM_HASHCHAIN_SPOOL_TTL_S:
+                continue
+            total_count += 1
+            if sender_id and str(evt.get("node_id", "") or "").strip() == sender_id:
+                sender_count += 1
+            if total_count >= DM_HASHCHAIN_SPOOL_LIMIT and (
+                not sender_id or sender_count >= DM_HASHCHAIN_SPOOL_SENDER_LIMIT
+            ):
+                break
+        return total_count, sender_count
+
+    def _dm_spool_active_count(self, payload: dict[str, Any], *, now: float | None = None) -> int:
+        total_count, _sender_count = self._dm_spool_active_counts(payload, now=now)
+        return total_count
+
+    def append_private_dm_message(
+        self,
+        *,
+        node_id: str,
+        payload: dict,
+        signature: str,
+        sequence: int,
+        public_key: str,
+        public_key_algo: str,
+        protocol_version: str = "",
+        timestamp: float = 0,
+    ) -> dict:
+        """Append an encrypted DM dead-drop message to the private Infonet ledger.
+
+        The event is a small offline spool, capped per mailbox target, so the
+        hashchain can carry a couple of sealed DMs without becoming an
+        unbounded global mailbox.
+        """
+        event_type = "dm_message"
+        if sequence <= 0:
+            raise ValueError("sequence is required and must be > 0")
+        sequence_table, sequence_key = self._sequence_table_for_event(event_type, node_id)
+        last = sequence_table.get(sequence_key, 0)
+        if sequence <= last:
+            raise ValueError(f"Replay detected: sequence {sequence} <= last {last}")
+
+        raw_payload = dict(payload or {})
+        if "message" in raw_payload or "plaintext" in raw_payload or "_local_plaintext" in raw_payload:
+            raise ValueError("private DM ledger payload must not contain plaintext")
+        if str(raw_payload.get("transport_lock", "") or "").strip().lower() != "private_strong":
+            raise ValueError("DM hashchain spool requires private_strong transport_lock")
+
+        payload = normalize_payload(event_type, raw_payload)
+        ok, reason = validate_private_dm_ledger_payload(payload)
+        if not ok:
+            raise ValueError(reason)
+        total_count, sender_count = self._dm_spool_active_counts(payload, sender_id=node_id)
+        if sender_count >= DM_HASHCHAIN_SPOOL_SENDER_LIMIT:
+            raise ValueError("DM hashchain sender spool full for recipient")
+        if total_count >= DM_HASHCHAIN_SPOOL_LIMIT:
+            raise ValueError("DM hashchain spool full for recipient")
+
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if len(payload_json.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+            raise ValueError("payload exceeds max size")
+
+        protocol_version = str(protocol_version or PROTOCOL_VERSION)
+        ok, reason = validate_protocol_fields(protocol_version, NETWORK_ID)
+        if not ok:
+            raise ValueError(reason)
+
+        if not (signature and public_key and public_key_algo):
+            raise ValueError("Missing signature fields")
+        algo = parse_public_key_algo(public_key_algo)
+        if not algo:
+            raise ValueError("Unsupported public_key_algo")
+        if not verify_node_binding(node_id, public_key):
+            raise ValueError("node_id mismatch")
+        bound, bind_reason = self._bind_public_key(public_key, node_id)
+        if not bound:
+            raise ValueError(bind_reason)
+        sig_payload = build_signature_payload(
+            event_type=event_type,
+            node_id=node_id,
+            sequence=sequence,
+            payload=payload,
+        )
+        if not verify_signature(
+            public_key_b64=public_key,
+            public_key_algo=public_key_algo,
+            signature_hex=signature,
+            payload=sig_payload,
+        ):
+            raise ValueError("Invalid signature")
+
+        revoked, _info = self._revocation_status(public_key)
+        if revoked:
+            raise ValueError("public key is revoked")
+
+        event = ChainEvent(
+            prev_hash=self.head_hash,
+            event_type=event_type,
+            node_id=node_id,
+            payload=payload,
+            timestamp=float(timestamp or time.time()),
+            sequence=sequence,
+            signature=signature,
+            public_key=public_key,
+            public_key_algo=public_key_algo,
+            protocol_version=protocol_version,
+        )
+        event_dict = event.to_dict()
+        self._write_wal(event_dict)
+        self.events.append(event_dict)
+        self.event_index[event.event_id] = len(self.events) - 1
+        self.head_hash = event.event_id
+        sequence_table[sequence_key] = sequence
+        self._replay_filter.add(event.event_id)
+        self._invalidate_merkle_cache()
+        self._update_counters_for_event(event_dict)
+        self._save()
+
+        try:
+            from services.mesh.mesh_rns import rns_bridge
+
+            rns_bridge.publish_event(event_dict)
+        except Exception:
+            pass
+        _notify_public_event_append_hooks(event_dict)
+        logger.info(
+            f"Infonet append [dm_message] by {_redact_node(node_id)} seq={sequence} "
+            f"id={event.event_id[:16]}..."
+        )
+        return event_dict
+
+    def append_private_gate_message(
+        self,
+        *,
+        node_id: str,
+        payload: dict,
+        signature: str,
+        sequence: int,
+        public_key: str,
+        public_key_algo: str,
+        protocol_version: str = "",
+        timestamp: float = 0,
+    ) -> dict:
+        """Append an encrypted gate message to the private Infonet ledger.
+
+        Gate messages use their own sequence domain so a gate post cannot
+        consume or replay-block the author's public broadcast sequence.
+        """
+        event_type = "gate_message"
+        if sequence <= 0:
+            raise ValueError("sequence is required and must be > 0")
+        sequence_table, sequence_key = self._sequence_table_for_event(event_type, node_id)
+        last = sequence_table.get(sequence_key, 0)
+        if sequence <= last:
+            raise ValueError(f"Replay detected: sequence {sequence} <= last {last}")
+
+        raw_payload = dict(payload or {})
+        if "message" in raw_payload or "_local_plaintext" in raw_payload or "_local_reply_to" in raw_payload:
+            raise ValueError("private gate ledger payload must not contain plaintext")
+        if str(raw_payload.get("transport_lock", "") or "").strip().lower() != "private_strong":
+            raise ValueError("gate messages require private_strong transport_lock")
+
+        payload = normalize_payload(event_type, raw_payload)
+        ok, reason = validate_private_gate_ledger_payload(payload)
+        if not ok:
+            raise ValueError(reason)
+
+        payload_json = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        if len(payload_json.encode("utf-8")) > MAX_PAYLOAD_BYTES:
+            raise ValueError("payload exceeds max size")
+
+        protocol_version = str(protocol_version or PROTOCOL_VERSION)
+        ok, reason = validate_protocol_fields(protocol_version, NETWORK_ID)
+        if not ok:
+            raise ValueError(reason)
+
+        if not (signature and public_key and public_key_algo):
+            raise ValueError("Missing signature fields")
+        algo = parse_public_key_algo(public_key_algo)
+        if not algo:
+            raise ValueError("Unsupported public_key_algo")
+        if not verify_node_binding(node_id, public_key):
+            raise ValueError("node_id mismatch")
+        bound, bind_reason = self._bind_public_key(public_key, node_id)
+        if not bound:
+            raise ValueError(bind_reason)
+        event_for_signature = {"payload": payload}
+        signature_ok = False
+        for signature_payload in _private_gate_signature_payload_variants(
+            str(payload.get("gate", "") or ""),
+            event_for_signature,
+        ):
+            sig_payload = build_signature_payload(
+                event_type=event_type,
+                node_id=node_id,
+                sequence=sequence,
+                payload=signature_payload,
+            )
+            if verify_signature(
+                public_key_b64=public_key,
+                public_key_algo=public_key_algo,
+                signature_hex=signature,
+                payload=sig_payload,
+            ):
+                signature_ok = True
+                break
+        if not signature_ok:
+            raise ValueError("Invalid signature")
+
+        revoked, _info = self._revocation_status(public_key)
+        if revoked:
+            raise ValueError("public key is revoked")
+
+        event = ChainEvent(
+            prev_hash=self.head_hash,
+            event_type=event_type,
+            node_id=node_id,
+            payload=payload,
+            timestamp=float(timestamp or time.time()),
+            sequence=sequence,
+            signature=signature,
+            public_key=public_key,
+            public_key_algo=public_key_algo,
+            protocol_version=protocol_version,
+        )
+        event_dict = event.to_dict()
+        self._write_wal(event_dict)
+        self.events.append(event_dict)
+        self.event_index[event.event_id] = len(self.events) - 1
+        self.head_hash = event.event_id
+        sequence_table[sequence_key] = sequence
+        self._replay_filter.add(event.event_id)
+        self._invalidate_merkle_cache()
+        self._update_counters_for_event(event_dict)
+        self._save()
+
+        try:
+            from services.mesh.mesh_rns import rns_bridge
+
+            rns_bridge.publish_event(event_dict)
+        except Exception:
+            pass
+        _notify_public_event_append_hooks(event_dict)
+
+        logger.info(
+            f"Infonet append [gate_message] by {_redact_node(node_id)} seq={sequence} "
+            f"id={event.event_id[:16]}..."
+        )
+        return event_dict
+
     def append(
         self,
         event_type: str,
@@ -2078,6 +2412,18 @@ class Infonet:
             if not event_id or not prev_hash:
                 rejected.append({"index": idx, "reason": "Missing event_id or prev_hash"})
                 continue
+            if event_id in self.event_index:
+                duplicates += 1
+                continue
+            if self._replay_filter.seen(event_id):
+                try:
+                    from services.mesh.mesh_metrics import increment as metrics_inc
+
+                    metrics_inc("ingest_replay_seen")
+                except Exception:
+                    pass
+                duplicates += 1
+                continue
             if prev_hash != expected_prev:
                 try:
                     from services.mesh.mesh_metrics import increment as metrics_inc
@@ -2096,25 +2442,14 @@ class Infonet:
                     pass
                 rejected.append({"index": idx, "reason": "network_id mismatch"})
                 continue
-            if event_id in self.event_index:
-                duplicates += 1
-                continue
-            if self._replay_filter.seen(event_id):
-                try:
-                    from services.mesh.mesh_metrics import increment as metrics_inc
-
-                    metrics_inc("ingest_replay_seen")
-                except Exception:
-                    pass
-                duplicates += 1
-                continue
             if prev_hash != self.head_hash:
                 rejected.append({"index": idx, "reason": "prev_hash does not match head"})
                 continue
             if sequence <= 0:
                 rejected.append({"index": idx, "reason": "Invalid sequence"})
                 continue
-            last = self.node_sequences.get(node_id, 0)
+            sequence_table, sequence_key = self._sequence_table_for_event(event_type, node_id)
+            last = sequence_table.get(sequence_key, 0)
             if sequence <= last:
                 rejected.append({"index": idx, "reason": "Replay detected"})
                 continue
@@ -2149,7 +2484,18 @@ class Infonet:
             if not ok:
                 rejected.append({"index": idx, "reason": reason})
                 continue
-            ok, reason = validate_public_ledger_payload(event_type, payload)
+            if event_type == "gate_message":
+                ok, reason = validate_private_gate_ledger_payload(payload)
+            elif event_type == "dm_message":
+                ok, reason = validate_private_dm_ledger_payload(payload)
+                if ok:
+                    total_count, sender_count = self._dm_spool_active_counts(payload, sender_id=str(evt.get("node_id", "") or ""))
+                    if sender_count >= DM_HASHCHAIN_SPOOL_SENDER_LIMIT:
+                        ok, reason = False, "DM hashchain sender spool full for recipient"
+                    elif total_count >= DM_HASHCHAIN_SPOOL_LIMIT:
+                        ok, reason = False, "DM hashchain spool full for recipient"
+            else:
+                ok, reason = validate_public_ledger_payload(event_type, payload)
             if not ok:
                 rejected.append({"index": idx, "reason": reason})
                 continue
@@ -2225,7 +2571,7 @@ class Infonet:
                     pass
                 rejected.append({"index": idx, "reason": "public key is revoked"})
                 continue
-            last_seq = self.node_sequences.get(node_id, 0)
+            last_seq = sequence_table.get(sequence_key, 0)
             if sequence <= last_seq:
                 try:
                     from services.mesh.mesh_metrics import increment as metrics_inc
@@ -2261,18 +2607,30 @@ class Infonet:
                 rejected.append({"index": idx, "reason": bind_reason})
                 continue
 
-            sig_payload = build_signature_payload(
-                event_type=event_type,
-                node_id=node_id,
-                sequence=sequence,
-                payload=payload,
-            )
-            if not verify_signature(
-                public_key_b64=public_key,
-                public_key_algo=public_key_algo,
-                signature_hex=signature,
-                payload=sig_payload,
-            ):
+            if event_type == "gate_message":
+                signature_payloads = _private_gate_signature_payload_variants(
+                    str(payload.get("gate", "") or ""),
+                    evt,
+                )
+            else:
+                signature_payloads = [payload]
+            signature_ok = False
+            for signature_payload in signature_payloads:
+                sig_payload = build_signature_payload(
+                    event_type=event_type,
+                    node_id=node_id,
+                    sequence=sequence,
+                    payload=signature_payload,
+                )
+                if verify_signature(
+                    public_key_b64=public_key,
+                    public_key_algo=public_key_algo,
+                    signature_hex=signature,
+                    payload=sig_payload,
+                ):
+                    signature_ok = True
+                    break
+            if not signature_ok:
                 try:
                     from services.mesh.mesh_metrics import increment as metrics_inc
 
@@ -2302,7 +2660,7 @@ class Infonet:
             self.events.append(evt)
             self.event_index[event_id] = len(self.events) - 1
             self.head_hash = event_id
-            self.node_sequences[node_id] = sequence
+            sequence_table[sequence_key] = sequence
             self._update_counters_for_event(evt)
             accepted += 1
             expected_prev = event_id
@@ -2365,6 +2723,7 @@ class Infonet:
                     verify_node_binding,
                 )
 
+                event_type = evt_dict.get("event_type", "")
                 node_id = evt_dict.get("node_id", "")
                 if not parse_public_key_algo(public_key_algo):
                     return False, f"Unsupported public_key_algo at index {i}"
@@ -2375,21 +2734,41 @@ class Infonet:
                     return False, f"public key binding conflict at index {i}"
                 seen_public_keys[public_key] = node_id
 
-                normalized = normalize_payload(
-                    evt_dict.get("event_type", ""), evt_dict.get("payload", {})
-                )
-                sig_payload = build_signature_payload(
-                    event_type=evt_dict.get("event_type", ""),
-                    node_id=node_id,
-                    sequence=_safe_int(evt_dict.get("sequence", 0) or 0, 0),
-                    payload=normalized,
-                )
-                if not verify_signature(
-                    public_key_b64=public_key,
-                    public_key_algo=public_key_algo,
-                    signature_hex=signature,
-                    payload=sig_payload,
-                ):
+                payload = evt_dict.get("payload", {})
+                if event_type == "gate_message":
+                    ok, reason = validate_private_gate_ledger_payload(payload)
+                    if not ok:
+                        return False, f"Invalid gate_message payload at index {i}: {reason}"
+                    signature_payloads = _private_gate_signature_payload_variants(
+                        str(payload.get("gate", "") or ""),
+                        evt_dict,
+                    )
+                elif event_type == "dm_message":
+                    ok, reason = validate_private_dm_ledger_payload(payload)
+                    if not ok:
+                        return False, f"Invalid dm_message payload at index {i}: {reason}"
+                    signature_payloads = [normalize_payload(event_type, payload)]
+                else:
+                    signature_payloads = [
+                        normalize_payload(event_type, payload)
+                    ]
+                signature_ok = False
+                for signature_payload in signature_payloads:
+                    sig_payload = build_signature_payload(
+                        event_type=event_type,
+                        node_id=node_id,
+                        sequence=_safe_int(evt_dict.get("sequence", 0) or 0, 0),
+                        payload=signature_payload,
+                    )
+                    if verify_signature(
+                        public_key_b64=public_key,
+                        public_key_algo=public_key_algo,
+                        signature_hex=signature,
+                        payload=sig_payload,
+                    ):
+                        signature_ok = True
+                        break
+                if not signature_ok:
                     return False, f"Invalid signature at index {i}"
 
             prev = evt_dict["event_id"]
@@ -2454,27 +2833,48 @@ class Infonet:
                     verify_node_binding,
                 )
 
+                event_type = evt_dict.get("event_type", "")
                 node_id = evt_dict.get("node_id", "")
                 if not parse_public_key_algo(public_key_algo):
                     return False, f"Unsupported public_key_algo at index {i}"
                 if not verify_node_binding(node_id, public_key):
                     return False, f"node_id mismatch at index {i}"
 
-                normalized = normalize_payload(
-                    evt_dict.get("event_type", ""), evt_dict.get("payload", {})
-                )
-                sig_payload = build_signature_payload(
-                    event_type=evt_dict.get("event_type", ""),
-                    node_id=node_id,
-                    sequence=_safe_int(evt_dict.get("sequence", 0) or 0, 0),
-                    payload=normalized,
-                )
-                if not verify_signature(
-                    public_key_b64=public_key,
-                    public_key_algo=public_key_algo,
-                    signature_hex=signature,
-                    payload=sig_payload,
-                ):
+                payload = evt_dict.get("payload", {})
+                if event_type == "gate_message":
+                    ok, reason = validate_private_gate_ledger_payload(payload)
+                    if not ok:
+                        return False, f"Invalid gate_message payload at index {i}: {reason}"
+                    signature_payloads = _private_gate_signature_payload_variants(
+                        str(payload.get("gate", "") or ""),
+                        evt_dict,
+                    )
+                elif event_type == "dm_message":
+                    ok, reason = validate_private_dm_ledger_payload(payload)
+                    if not ok:
+                        return False, f"Invalid dm_message payload at index {i}: {reason}"
+                    signature_payloads = [normalize_payload(event_type, payload)]
+                else:
+                    signature_payloads = [
+                        normalize_payload(event_type, payload)
+                    ]
+                signature_ok = False
+                for signature_payload in signature_payloads:
+                    sig_payload = build_signature_payload(
+                        event_type=event_type,
+                        node_id=node_id,
+                        sequence=_safe_int(evt_dict.get("sequence", 0) or 0, 0),
+                        payload=signature_payload,
+                    )
+                    if verify_signature(
+                        public_key_b64=public_key,
+                        public_key_algo=public_key_algo,
+                        signature_hex=signature,
+                        payload=sig_payload,
+                    ):
+                        signature_ok = True
+                        break
+                if not signature_ok:
                     return False, f"Invalid signature at index {i}"
             prev = evt_dict["event_id"]
 
@@ -2538,7 +2938,14 @@ class Infonet:
             node_id = evt.get("node_id", "")
             sequence = _safe_int(evt.get("sequence", 0) or 0, 0)
             if node_id and sequence:
-                last_seq[node_id] = max(last_seq.get(node_id, 0), sequence)
+                sequence_key = (
+                    f"{node_id}|gate_message"
+                    if str(evt.get("event_type", "") or "").strip().lower() == "gate_message"
+                    else f"{node_id}|dm_message"
+                    if str(evt.get("event_type", "") or "").strip().lower() == "dm_message"
+                    else node_id
+                )
+                last_seq[sequence_key] = max(last_seq.get(sequence_key, 0), sequence)
             public_key = str(evt.get("public_key", "") or "")
             if public_key and node_id:
                 seen_public_keys.setdefault(public_key, node_id)
@@ -2558,8 +2965,21 @@ class Infonet:
             existing_idx = self.event_index.get(event_id)
             if existing_idx is not None and existing_idx <= prev_index:
                 return False, "duplicate event_id"
-            payload = normalize_payload(event_type, dict(payload or {}))
+            if event_type == "gate_message":
+                payload = dict(payload or {})
+            elif event_type == "dm_message":
+                payload = normalize_payload(event_type, dict(payload or {}))
+            else:
+                payload = normalize_payload(event_type, dict(payload or {}))
             ok, reason = validate_event_payload(event_type, payload)
+            if not ok:
+                return False, reason
+            if event_type == "gate_message":
+                ok, reason = validate_private_gate_ledger_payload(payload)
+            elif event_type == "dm_message":
+                ok, reason = validate_private_dm_ledger_payload(payload)
+            else:
+                ok, reason = validate_public_ledger_payload(event_type, payload)
             if not ok:
                 return False, reason
             proto = evt.get("protocol_version") or PROTOCOL_VERSION
@@ -2573,7 +2993,14 @@ class Infonet:
             revoked, _info = self._revocation_status(public_key)
             if revoked and event_type != "key_revoke":
                 return False, "public key revoked"
-            last = last_seq.get(node_id, 0)
+            sequence_key = (
+                f"{node_id}|gate_message"
+                if event_type == "gate_message"
+                else f"{node_id}|dm_message"
+                if event_type == "dm_message"
+                else node_id
+            )
+            last = last_seq.get(sequence_key, 0)
             if sequence <= last:
                 return False, "sequence replay"
             from services.mesh.mesh_crypto import (
@@ -2591,23 +3018,35 @@ class Infonet:
             if existing and existing != node_id:
                 return False, "public key binding conflict"
             seen_public_keys[public_key] = node_id
-            sig_payload = build_signature_payload(
-                event_type=event_type,
-                node_id=node_id,
-                sequence=sequence,
-                payload=payload,
-            )
-            if not verify_signature(
-                public_key_b64=public_key,
-                public_key_algo=public_key_algo,
-                signature_hex=signature,
-                payload=sig_payload,
-            ):
+            if event_type == "gate_message":
+                signature_payloads = _private_gate_signature_payload_variants(
+                    str(payload.get("gate", "") or ""),
+                    evt,
+                )
+            else:
+                signature_payloads = [payload]
+            signature_ok = False
+            for signature_payload in signature_payloads:
+                sig_payload = build_signature_payload(
+                    event_type=event_type,
+                    node_id=node_id,
+                    sequence=sequence,
+                    payload=signature_payload,
+                )
+                if verify_signature(
+                    public_key_b64=public_key,
+                    public_key_algo=public_key_algo,
+                    signature_hex=signature,
+                    payload=sig_payload,
+                ):
+                    signature_ok = True
+                    break
+            if not signature_ok:
                 return False, "invalid signature"
             computed = ChainEvent.from_dict(evt).event_id
             if computed != event_id:
                 return False, "event_id mismatch"
-            last_seq[node_id] = sequence
+            last_seq[sequence_key] = sequence
 
         # Apply fork
         self.events = prefix + ordered

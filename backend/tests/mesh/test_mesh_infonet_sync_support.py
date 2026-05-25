@@ -117,3 +117,11 @@ def test_finish_solo_sync_marks_first_node_ready_without_peer_failure():
     assert finished.next_sync_due_at == 500
     assert should_run_sync(finished, now=499) is False
     assert should_run_sync(finished, now=500) is True
+
+
+def test_should_run_sync_recovers_stale_running_state():
+    fresh = SyncWorkerState(last_sync_started_at=100, last_outcome="running")
+    stale = SyncWorkerState(last_sync_started_at=100, last_outcome="running")
+
+    assert should_run_sync(fresh, now=399) is False
+    assert should_run_sync(stale, now=400) is True
