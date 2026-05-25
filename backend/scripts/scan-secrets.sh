@@ -92,18 +92,37 @@ SECRET_REGEX+='pypi-[0-9a-zA-Z-]{50,}'                        # PyPI token
 TEXT_FILES=$(grep -ivE '\.(png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot|pbf|zip|tar|gz|db|sqlite|xlsx|pdf|mp[34]|wav|ogg|webm|webp|avif)$' "$FILELIST" | grep -v 'scan-secrets\.sh$' || true)
 
 if [[ -n "$TEXT_FILES" ]]; then
+    # Known-public exclusions: lines matching `<host-or-ip> ssh-<algo> <key>`
+    # are SSH known_hosts entries — the host's PUBLIC fingerprint, which is
+    # by definition safe to commit (the whole point of pinning known_hosts
+    # is to publish the fingerprint widely so MITM is detectable). Filter
+    # these out before flagging the file.
+    KNOWN_HOSTS_LINE='^[[:space:]]*[a-zA-Z0-9._:,*-]+([[:space:]]+[a-zA-Z0-9._:,*-]+)?[[:space:]]+(ssh-rsa|ssh-ed25519|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521)[[:space:]]+AAAA'
+
     # Use grep with file list, skip missing/binary, limit output
     CONTENT_HITS=$(echo "$TEXT_FILES" | xargs grep -lE "$SECRET_REGEX" 2>/dev/null || true)
     if [[ -n "$CONTENT_HITS" ]]; then
-        echo -e "\n${RED}BLOCKED: Embedded secrets/tokens found in:${NC}"
-        echo "$CONTENT_HITS" | while read -r f; do
-            echo -e "  ${RED}$f${NC}"
-            # Show first matching line for context
-            grep -nE "$SECRET_REGEX" "$f" 2>/dev/null | head -2 | while read -r line; do
-                echo -e "    ${YELLOW}$line${NC}"
-            done
-        done
-        FOUND=1
+        REAL_HITS=""
+        REAL_REPORT=""
+        while IFS= read -r f; do
+            [[ -z "$f" ]] && continue
+            # Re-grep this file, but filter out known_hosts-style lines.
+            FILE_HITS=$(grep -nE "$SECRET_REGEX" "$f" 2>/dev/null | grep -vE "$KNOWN_HOSTS_LINE" || true)
+            if [[ -n "$FILE_HITS" ]]; then
+                REAL_HITS+="$f"$'\n'
+                REAL_REPORT+="  ${RED}$f${NC}"$'\n'
+                # Show first 2 matching lines for context
+                while IFS= read -r line; do
+                    [[ -z "$line" ]] && continue
+                    REAL_REPORT+="    ${YELLOW}$line${NC}"$'\n'
+                done < <(echo "$FILE_HITS" | head -2)
+            fi
+        done <<< "$CONTENT_HITS"
+        if [[ -n "$REAL_HITS" ]]; then
+            echo -e "\n${RED}BLOCKED: Embedded secrets/tokens found in:${NC}"
+            echo -en "$REAL_REPORT"
+            FOUND=1
+        fi
     fi
 fi
 
