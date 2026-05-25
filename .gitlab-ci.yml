@@ -52,7 +52,11 @@ variables:
     - docker info
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_JOB_TOKEN" "$CI_REGISTRY"
     - docker run --privileged --rm tonistiigi/binfmt --install all
-    - docker buildx create --use --name multiarch --driver docker-container
+    # buildx --driver docker-container can't read TLS from the env vars
+    # the GitLab dind service exports. Wrap them in a docker context and
+    # bind buildx to it. See https://docs.gitlab.com/ee/ci/docker/using_docker_build.html#use-docker-buildx
+    - docker context create tls-env
+    - docker buildx create --use --name multiarch --driver docker-container tls-env
 
 # ── Backend image ────────────────────────────────────────────────────────
 build-backend:
