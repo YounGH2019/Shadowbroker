@@ -37,10 +37,9 @@ _SOURCE_URL_HTTPS = "https://rx.linkfanel.net/kiwisdr_com.js"
 _CACHE_FILE = Path(__file__).resolve().parent.parent / "data" / "kiwisdr_cache.json"
 # Bundled fallback — shipped with the codebase so the KiwiSDR layer always
 # has something to render even when the upstream is unreachable, returns
-# garbage, or appears to have been tampered with. Issue #206: the upstream
-# only speaks HTTP, so we can't rely on TLS for integrity — instead we
-# validate the response's shape and fall back to this bundle if it doesn't
-# look right.
+# garbage, or appears to have been tampered with. Issue #206 / #364: try HTTPS
+# first, then HTTP; we still validate shape and fall back to this bundle if the
+# payload does not look right.
 _BUNDLED_FALLBACK = Path(__file__).resolve().parent.parent / "data" / "kiwisdr_directory.json"
 
 # Minimum number of receivers we expect from a healthy upstream response.
@@ -226,9 +225,8 @@ def _load_bundled_fallback() -> list[dict]:
 def fetch_kiwisdr_nodes() -> list[dict]:
     """Return the KiwiSDR receiver list, refreshed at most once per day.
 
-    Layered fallback (issue #206 — upstream is HTTP-only, so we defend with
-    content validation + bundled static directory rather than trying to
-    upgrade the transport):
+    Layered fallback (issue #206 / #364 — HTTPS first, HTTP fallback, plus
+    content validation + bundled static directory):
 
       1. In-memory cache (handled by @cached on this function)
       2. On-disk cache if <24h old
