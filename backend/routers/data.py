@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from limiter import limiter
 from auth import require_admin, require_local_operator
-from services.data_fetcher import get_latest_data, update_all_data
+from services.data_fetcher import update_all_data
 import orjson
 import json as json_mod
 
@@ -554,7 +554,17 @@ async def update_layers(update: LayerUpdate, request: Request):
 @router.get("/api/live-data")
 @limiter.limit("120/minute")
 async def live_data(request: Request):
-    return get_latest_data()
+    etag = _current_etag(prefix="live|full|")
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+    from services.fetchers._store import get_latest_data_deepcopy_snapshot
+
+    payload = get_latest_data_deepcopy_snapshot()
+    return Response(
+        content=orjson.dumps(_sanitize_payload(payload)),
+        media_type="application/json",
+        headers={"ETag": etag, "Cache-Control": "no-cache"},
+    )
 
 
 @router.get("/api/bootstrap/critical")

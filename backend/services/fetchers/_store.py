@@ -241,16 +241,22 @@ def get_active_layers_version() -> int:
 def get_latest_data_subset(*keys: str) -> DashboardData:
     """Return a deep snapshot of only the requested top-level keys.
 
-    This avoids cloning the entire dashboard store for endpoints that only need
-    a small tier-specific subset.  Deep copy ensures callers cannot mutate
-    nested structures (e.g. individual flight dicts) and affect the live store.
+    Grabs references under the lock, then deep-copies outside it so fetcher
+    writers are not blocked for the duration of a large clone (#375).
     """
     with _data_lock:
-        snap: DashboardData = {}
-        for key in keys:
-            value = latest_data.get(key)
-            snap[key] = copy.deepcopy(value)
-        return snap
+        items = [(key, latest_data.get(key)) for key in keys]
+    snap: DashboardData = {}
+    for key, value in items:
+        snap[key] = copy.deepcopy(value)
+    return snap
+
+
+def get_latest_data_deepcopy_snapshot() -> DashboardData:
+    """Deep-copy the full dashboard for legacy /api/live-data consumers."""
+    with _data_lock:
+        items = list(latest_data.items())
+    return {key: copy.deepcopy(value) for key, value in items}
 
 
 def get_latest_data_subset_refs(*keys: str) -> DashboardData:

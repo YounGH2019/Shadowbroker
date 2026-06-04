@@ -3851,7 +3851,17 @@ async def update_layers(update: LayerUpdate, request: Request):
 @app.get("/api/live-data")
 @limiter.limit("120/minute")
 async def live_data(request: Request):
-    return get_latest_data()
+    etag = _current_etag(prefix="live|full|")
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+    from services.fetchers._store import get_latest_data_deepcopy_snapshot
+
+    payload = get_latest_data_deepcopy_snapshot()
+    return Response(
+        content=orjson.dumps(_sanitize_payload(payload)),
+        media_type="application/json",
+        headers={"ETag": etag, "Cache-Control": "no-cache"},
+    )
 
 
 def _etag_response(request: Request, payload: dict, prefix: str = "", default=None):
@@ -12044,5 +12054,36 @@ async def system_update(request: Request):
     return result
 
 
+def _dev_uvicorn_bind_host() -> str:
+    """Default loopback for `python main.py` so LAN clients cannot reach a dev server (#375).
+
+    Docker compose still publishes 127.0.0.1:8000; the dashboard stays on :3000.
+    Set SHADOWBROKER_DEV_BIND_ALL=true only when you intentionally need LAN access
+    (and use ADMIN_KEY for remote callers).
+    """
+    if str(os.environ.get("SHADOWBROKER_DEV_BIND_ALL", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, timeout_keep_alive=120)
+    _host = _dev_uvicorn_bind_host()
+    _port = int(os.environ.get("BACKEND_PORT", "8000"))
+    if _host == "127.0.0.1":
+        logger.info(
+            "Dev server binding %s:%s (loopback). Set SHADOWBROKER_DEV_BIND_ALL=true for 0.0.0.0.",
+            _host,
+            _port,
+        )
+    uvicorn.run(
+        "main:app",
+        host=_host,
+        port=_port,
+        reload=True,
+        timeout_keep_alive=120,
+    )

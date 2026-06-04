@@ -145,12 +145,17 @@ _STARTUP_HEAVY_REFRESH_DELAY_S = float(os.environ.get("SHADOWBROKER_STARTUP_HEAV
 _STARTUP_HEAVY_REFRESH_STARTED = False
 _STARTUP_HEAVY_REFRESH_LOCK = threading.Lock()
 _FETCH_WORKERS = int(os.environ.get("SHADOWBROKER_FETCH_WORKERS", "8"))
+_HEAVY_FETCH_WORKERS = int(os.environ.get("SHADOWBROKER_HEAVY_FETCH_WORKERS", "2"))
 _SLOW_FETCH_CONCURRENCY = int(os.environ.get("SHADOWBROKER_SLOW_FETCH_CONCURRENCY", "4"))
 _STARTUP_HEAVY_CONCURRENCY = int(os.environ.get("SHADOWBROKER_STARTUP_HEAVY_CONCURRENCY", "2"))
 
-# Shared thread pool — reused across all fetch cycles instead of creating/destroying per tick
+# Fast-tier pool (flights, ships, sigint, …). Slow / heavy work uses a separate pool
+# so Playwright, GDELT, CCTV ingest, etc. cannot starve the 60s refresh path (#375).
 _SHARED_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=max(2, _FETCH_WORKERS), thread_name_prefix="fetch"
+)
+_SLOW_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(1, _HEAVY_FETCH_WORKERS), thread_name_prefix="fetch-slow"
 )
 
 
@@ -320,10 +325,42 @@ def seed_startup_caches() -> None:
 # ---------------------------------------------------------------------------
 # Scheduler & Orchestration
 # ---------------------------------------------------------------------------
+def _executor_for_task_label(label: str) -> concurrent.futures.ThreadPoolExecutor:
+    if label.startswith(("slow-tier", "startup-heavy")):
+        return _SLOW_EXECUTOR
+    return _SHARED_EXECUTOR
+
+
+def _run_task_with_health_on_executor(
+    executor: concurrent.futures.ThreadPoolExecutor,
+    func,
+    name: str | None = None,
+) -> None:
+    """Run a scheduled job on the given pool so it cannot starve fast-tier workers."""
+    task_name = name or getattr(func, "__name__", "task")
+    future = executor.submit(func)
+    start = time.perf_counter()
+    try:
+        future.result(timeout=_TASK_HARD_TIMEOUT_S)
+        duration = time.perf_counter() - start
+        from services.fetch_health import record_success
+
+        record_success(task_name, duration_s=duration)
+        if duration > _SLOW_FETCH_S:
+            logger.warning("task slow: %s took %.2f}s", task_name, duration)
+    except Exception as e:
+        duration = time.perf_counter() - start
+        from services.fetch_health import record_failure
+
+        record_failure(task_name, error=e, duration_s=duration)
+        logger.exception("task failed: %s", task_name)
+
+
 def _run_tasks(label: str, funcs: list, *, max_concurrency: int | None = None):
     """Run tasks concurrently and log any exceptions (do not fail silently)."""
     if not funcs:
         return
+    executor = _executor_for_task_label(label)
     if max_concurrency is None:
         if label.startswith("slow-tier"):
             max_concurrency = _SLOW_FETCH_CONCURRENCY
@@ -336,7 +373,7 @@ def _run_tasks(label: str, funcs: list, *, max_concurrency: int | None = None):
     remaining_funcs = list(funcs)
     while remaining_funcs:
         batch, remaining_funcs = remaining_funcs[:max_concurrency], remaining_funcs[max_concurrency:]
-        futures = {_SHARED_EXECUTOR.submit(func): (func.__name__, time.perf_counter()) for func in batch}
+        futures = {executor.submit(func): (func.__name__, time.perf_counter()) for func in batch}
         _drain_task_futures(label, futures)
 
 
@@ -865,7 +902,7 @@ def start_scheduler():
 
     # GDELT — every 30 minutes (downloads 32 ZIP files per call, avoid rate limits)
     _scheduler.add_job(
-        lambda: _run_task_with_health(fetch_gdelt, "fetch_gdelt"),
+        lambda: _run_task_with_health_on_executor(_SLOW_EXECUTOR, fetch_gdelt, "fetch_gdelt"),
         "interval",
         minutes=30,
         id="gdelt",
@@ -873,7 +910,9 @@ def start_scheduler():
         misfire_grace_time=120,
     )
     _scheduler.add_job(
-        lambda: _run_task_with_health(update_liveuamap, "update_liveuamap"),
+        lambda: _run_task_with_health_on_executor(
+            _SLOW_EXECUTOR, update_liveuamap, "update_liveuamap"
+        ),
         "interval",
         minutes=30,
         id="liveuamap",
@@ -934,7 +973,9 @@ def start_scheduler():
             logger.warning(f"CCTV post-ingest refresh failed: {e}")
 
     _scheduler.add_job(
-        _run_cctv_ingest_cycle,
+        lambda: _run_task_with_health_on_executor(
+            _SLOW_EXECUTOR, _run_cctv_ingest_cycle, "cctv_ingest_cycle"
+        ),
         "interval",
         minutes=10,
         id="cctv_ingest",
@@ -1151,7 +1192,10 @@ def start_scheduler():
 def stop_scheduler():
     if _scheduler:
         _scheduler.shutdown(wait=False)
+    _SLOW_EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 def get_latest_data():
-    return get_latest_data_subset(*latest_data.keys())
+    from services.fetchers._store import get_latest_data_deepcopy_snapshot
+
+    return get_latest_data_deepcopy_snapshot()

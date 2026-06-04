@@ -600,9 +600,16 @@ Open `http://localhost:3000` to view the dashboard.
 > **Deploying publicly or on a LAN?** No configuration needed for most setups.
 > The frontend proxies all API calls through the Next.js server to `BACKEND_URL`,
 > which defaults to `http://backend:8000` (Docker internal networking).
-> Host port `8000` is only published for local API/debug access. If it conflicts
-> with another service, set `BACKEND_PORT=8001` in `.env`; leave `BACKEND_URL`
-> as `http://backend:8000` because that is the Docker-internal port.
+> Host port `8000` is only published for local API/debug access (`127.0.0.1:8000`
+> in `docker-compose.yml`). If it conflicts with another service, set
+> `BACKEND_PORT=8001` in `.env`; leave `BACKEND_URL` as `http://backend:8000`
+> because that is the Docker-internal port.
+>
+> **Running the backend outside Docker** (`cd backend && python main.py`):
+> the dev server binds **loopback only** (`127.0.0.1:8000`) so other machines on
+> your LAN cannot hit admin/local-trust routes with an empty `ADMIN_KEY`. Set
+> `SHADOWBROKER_DEV_BIND_ALL=true` in `.env` only when you deliberately need
+> `0.0.0.0` and use a strong `ADMIN_KEY` for any non-local callers.
 > The backend memory cap is controlled by `BACKEND_MEMORY_LIMIT` and defaults
 > to `4G`. If Docker reports OOM events, the backend will restart and slow
 > layers can look empty until they repopulate.
