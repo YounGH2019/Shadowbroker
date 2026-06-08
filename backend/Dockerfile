@@ -45,7 +45,7 @@ COPY uv.lock /workspace/uv.lock
 COPY backend/pyproject.toml /workspace/backend/pyproject.toml
 
 # Install Python dependencies using the lockfile
-RUN cd /workspace/backend && uv sync --frozen --no-dev \
+RUN cd /workspace/backend && uv sync --frozen --no-dev --extra road-corridor \
     && playwright install --with-deps chromium
 
 # Copy backend source code

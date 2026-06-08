@@ -921,6 +921,19 @@ export interface DashboardData {
   sar_anomalies?: SarAnomaly[];
   sar_aoi_coverage?: SarAoiCoverage[];
   sar_aois?: SarAoi[];
+
+  road_corridor_trends?: {
+    updated_at?: string | null;
+    corridors?: Array<{
+      preset_id: string;
+      label: string;
+      status: string;
+      total_detections?: number;
+      daily_counts?: Array<{ date: string; count: number }>;
+      updated_at?: string;
+      error?: string | null;
+    }>;
+  };
 }
 
 // ─── SAR ─────────────────────────────────────────────────────────────────────
@@ -1030,6 +1043,7 @@ export interface ActiveLayers {
   ai_intel: boolean;
   crowdthreat: boolean;
   sar: boolean;
+  road_corridor_trends: boolean;
 }
 
 export interface SelectedEntity {

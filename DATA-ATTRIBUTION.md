@@ -44,7 +44,8 @@ These sources have their own terms; consult each link before redistributing.
 | aisstream.io | https://aisstream.io | Free-tier API terms (attribution required) | AIS vessel positions |
 | Global Fishing Watch | https://globalfishingwatch.org | CC BY 4.0 (for public data) | Fishing activity events |
 | Microsoft Planetary Computer | https://planetarycomputer.microsoft.com | Sentinel-2 / ESA Copernicus terms | Sentinel-2 imagery |
-| Copernicus CDSE (Sentinel Hub) | https://dataspace.copernicus.eu | ESA Copernicus open data terms | SAR + optical imagery |
+| Copernicus CDSE (Sentinel Hub) | https://dataspace.copernicus.eu | ESA Copernicus open data terms | SAR + optical imagery, optional road-corridor truck trends |
+| DrishX / Fisser et al. 2022 | https://github.com/sparkyniner/DRISH-X-Satellite-powered-freight-intelligence- | MIT (engine); research methodology attribution | Sentinel-2 motion-smear truck detection on major roads (opt-in) |
 | Shodan | https://www.shodan.io | Operator-supplied API key, Shodan ToS | Internet device search |
 | Smithsonian GVP | https://volcano.si.edu | Attribution required | Volcanoes |
 | OpenAQ | https://openaq.org | CC BY 4.0 | Air quality stations |

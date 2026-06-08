@@ -76,6 +76,7 @@ from services.fetchers.infrastructure import (  # noqa: F401
     fetch_tinygs,
     fetch_psk_reporter,
 )
+from services.fetchers.road_corridor_sat import fetch_road_corridor_trends  # noqa: F401
 from services.fetchers.geo import (  # noqa: F401
     fetch_ships,
     fetch_airports,
@@ -347,7 +348,14 @@ def _run_task_with_health_on_executor(
 
         record_success(task_name, duration_s=duration)
         if duration > _SLOW_FETCH_S:
-            logger.warning("task slow: %s took %.2f}s", task_name, duration)
+            logger.warning("task slow: %s took %.2fs", task_name, duration)
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        duration = time.perf_counter() - start
+        from services.fetch_health import record_failure
+
+        record_failure(task_name, error=TimeoutError(f"{task_name} timed out"), duration_s=duration)
+        logger.error("task timed out: %s (%.2fs)", task_name, duration)
     except Exception as e:
         duration = time.perf_counter() - start
         from services.fetch_health import record_failure
@@ -368,7 +376,8 @@ def _run_tasks(label: str, funcs: list, *, max_concurrency: int | None = None):
             max_concurrency = _STARTUP_HEAVY_CONCURRENCY
         else:
             max_concurrency = len(funcs)
-    max_concurrency = max(1, min(max_concurrency, len(funcs)))
+    pool_workers = getattr(executor, "_max_workers", len(funcs))
+    max_concurrency = max(1, min(max_concurrency, len(funcs), pool_workers))
 
     remaining_funcs = list(funcs)
     while remaining_funcs:
@@ -390,6 +399,13 @@ def _drain_task_futures(label: str, futures: dict):
             record_success(name, duration_s=duration)
             if duration > _SLOW_FETCH_S:
                 logger.warning(f"{label} task slow: {name} took {duration:.2f}s")
+        except concurrent.futures.TimeoutError:
+            future.cancel()
+            duration = time.perf_counter() - start
+            from services.fetch_health import record_failure
+
+            record_failure(name, error=TimeoutError(f"{name} timed out"), duration_s=duration)
+            logger.error("%s task timed out: %s (%.2fs)", label, name, duration)
         except Exception as e:
             duration = time.perf_counter() - start
             from services.fetch_health import record_failure
@@ -1043,6 +1059,16 @@ def start_scheduler():
         id="viirs_change",
         max_instances=1,
         misfire_grace_time=600,
+    )
+
+    # Sentinel-2 road corridor freight trends — daily (opt-in, heavy CDSE usage)
+    _scheduler.add_job(
+        lambda: _run_task_with_health(fetch_road_corridor_trends, "fetch_road_corridor_trends"),
+        "interval",
+        hours=24,
+        id="road_corridor_trends",
+        max_instances=1,
+        misfire_grace_time=3600,
     )
 
     # FIMI disinformation index — every 12 hours (weekly editorial feed)

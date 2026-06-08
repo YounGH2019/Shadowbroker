@@ -201,7 +201,18 @@
     "crowdThreat": "CrowdThreat",
     "shodanOverlay": "Couche Shodan",
     "aiIntel": "Infos IA",
-    "sar": "SAR"
+    "sar": "SAR",
+    "roadCorridorTrends": "Tendances fret routier",
+    "roadCorridorSource": "Copernicus S-2 · tendances (pas en direct)"
+  },
+  "roadCorridor": {
+    "analyzeHere": "ANALYSER ICI",
+    "analyzing": "Analyse…",
+    "hintTrends": "Tendances camions par satellite sur autoroutes (~5 j de revisite)",
+    "missingDeps": "Installer les extras backend road-corridor",
+    "missingCreds": "Ajouter les identifiants Sentinel dans Réglages → Imagerie",
+    "panMapFirst": "Déplacez la carte pour choisir une zone",
+    "analyzeFailed": "Échec de l'analyse"
   },
   "shodan": {
     "title": "Connecteur Shodan",

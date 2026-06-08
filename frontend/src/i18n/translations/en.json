@@ -201,7 +201,18 @@
     "crowdThreat": "CrowdThreat",
     "shodanOverlay": "Shodan Overlay",
     "aiIntel": "AI Intel",
-    "sar": "SAR"
+    "sar": "SAR",
+    "roadCorridorTrends": "Road Freight Trends",
+    "roadCorridorSource": "Copernicus S-2 · trends not live"
+  },
+  "roadCorridor": {
+    "analyzeHere": "ANALYZE HERE",
+    "analyzing": "Analyzing…",
+    "hintTrends": "Satellite truck-volume trends on major highways (~5 day revisit)",
+    "missingDeps": "Install backend road-corridor extras to analyze",
+    "missingCreds": "Add Sentinel creds in Settings → Imagery",
+    "panMapFirst": "Pan the map to choose an area",
+    "analyzeFailed": "Analysis failed"
   },
   "shodan": {
     "title": "Shodan Connector",

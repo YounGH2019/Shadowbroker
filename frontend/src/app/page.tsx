@@ -185,6 +185,7 @@ export default function Dashboard() {
     highres_satellite: false,
     sentinel_hub: false,
     viirs_nightlights: false,
+    road_corridor_trends: false,
     // Hazards — no fire, rest ON
     earthquakes: true,
     firms: false,
@@ -446,6 +447,7 @@ export default function Dashboard() {
       highres_satellite: false,
       sentinel_hub: false,
       viirs_nightlights: false,
+      road_corridor_trends: false,
       psk_reporter: false,
       tinygs: false,
       datacenters: false,
@@ -589,6 +591,7 @@ export default function Dashboard() {
                       setTrackedScanner={setTrackedScanner}
                       isMinimized={leftDataMinimized}
                       onMinimizedChange={setLeftDataMinimized}
+                      viewBoundsRef={viewBoundsRef}
                     />
                   </ErrorBoundary>
                 ) : (

@@ -39,6 +39,9 @@ def fetch_liveuamap():
             viewport={"width": 1920, "height": 1080},
             color_scheme="dark",
         )
+        # Bound navigation and script evaluation so a stuck region cannot hang the slow pool.
+        context.set_default_navigation_timeout(60_000)
+        context.set_default_timeout(30_000)
         page = context.new_page()
         stealth_sync(page)
 

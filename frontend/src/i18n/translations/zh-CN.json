@@ -201,7 +201,18 @@
     "crowdThreat": "人群威胁",
     "shodanOverlay": "Shodan 叠加",
     "aiIntel": "AI 情报",
-    "sar": "SAR"
+    "sar": "SAR",
+    "roadCorridorTrends": "公路货运趋势",
+    "roadCorridorSource": "Copernicus S-2 · 趋势（非实时）"
+  },
+  "roadCorridor": {
+    "analyzeHere": "分析此处",
+    "analyzing": "分析中…",
+    "hintTrends": "主要高速公路卫星卡车量趋势（约 5 天重访）",
+    "missingDeps": "请安装 backend road-corridor 可选依赖",
+    "missingCreds": "请在设置 → 影像 中添加 Sentinel 凭据",
+    "panMapFirst": "请先平移地图以选择区域",
+    "analyzeFailed": "分析失败"
   },
   "shodan": {
     "title": "Shodan 连接器",

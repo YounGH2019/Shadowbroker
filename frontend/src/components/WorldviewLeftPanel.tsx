@@ -43,7 +43,9 @@ import {
   Droplets,
   Radar,
   MapPin,
+  Truck,
 } from 'lucide-react';
+import RoadCorridorLayerControls from '@/components/RoadCorridorLayerControls';
 import { API_BASE } from '@/lib/api';
 import { useLiveUamapScraperOptIn } from '@/hooks/useLiveUamapScraperOptIn';
 import ConfirmDialog from '@/components/ui/ConfirmDialog';
@@ -107,6 +109,7 @@ const FRESHNESS_MAP: Record<string, string> = {
   wastewater: 'wastewater',
   ai_intel: '',
   crowdthreat: 'crowdthreat',
+  road_corridor_trends: 'road_corridor_trends',
 };
 
 // POTUS fleet ICAO hex codes for client-side filtering
@@ -650,6 +653,7 @@ const WorldviewLeftPanel = React.memo(function WorldviewLeftPanel({
   isMinimized: isMinimizedProp,
   onMinimizedChange,
   onOpenSarAoiEditor,
+  viewBoundsRef,
 }: {
   activeLayers: ActiveLayers;
   setActiveLayers: React.Dispatch<React.SetStateAction<ActiveLayers>>;
@@ -675,6 +679,7 @@ const WorldviewLeftPanel = React.memo(function WorldviewLeftPanel({
   isMinimized?: boolean;
   onMinimizedChange?: (minimized: boolean) => void;
   onOpenSarAoiEditor?: () => void;
+  viewBoundsRef?: React.RefObject<{ south: number; west: number; north: number; east: number } | null>;
 }) {
   const data = useDataSnapshot() as import('@/types/dashboard').DashboardData;
   const { t } = useTranslation();
@@ -1039,6 +1044,15 @@ const WorldviewLeftPanel = React.memo(function WorldviewLeftPanel({
           count: null,
           icon: Moon,
         },
+        {
+          id: 'road_corridor_trends',
+          name: t('layers.roadCorridorTrends'),
+          source: t('layers.roadCorridorSource'),
+          count:
+            data?.road_corridor_trends?.corridors?.filter((c) => (c.total_detections ?? 0) > 0)
+              .length ?? 0,
+          icon: Truck,
+        },
       ],
     },
     {
@@ -1401,21 +1415,21 @@ const WorldviewLeftPanel = React.memo(function WorldviewLeftPanel({
             <button
               title={
                 Object.entries(activeLayers)
-                  .filter(([k]) => !['gibs_imagery', 'highres_satellite', 'sentinel_hub', 'viirs_nightlights'].includes(k))
+                  .filter(([k]) => !['gibs_imagery', 'highres_satellite', 'sentinel_hub', 'viirs_nightlights', 'road_corridor_trends'].includes(k))
                   .every(([, v]) => v)
                   ? 'Disable all layers'
                   : 'Enable all layers'
               }
               className={`${
                 Object.entries(activeLayers)
-                  .filter(([k]) => !['gibs_imagery', 'highres_satellite', 'sentinel_hub', 'viirs_nightlights'].includes(k))
+                  .filter(([k]) => !['gibs_imagery', 'highres_satellite', 'sentinel_hub', 'viirs_nightlights', 'road_corridor_trends'].includes(k))
                   .every(([, v]) => v)
                   ? 'text-cyan-400'
                   : 'text-[var(--text-muted)]'
               } hover:text-cyan-400 transition-colors`}
               onClick={(e) => {
                 e.stopPropagation();
-                const excluded = new Set(['gibs_imagery', 'highres_satellite', 'sentinel_hub', 'viirs_nightlights']);
+                const excluded = new Set(['gibs_imagery', 'highres_satellite', 'sentinel_hub', 'viirs_nightlights', 'road_corridor_trends']);
                 const allOn = Object.entries(activeLayers)
                   .filter(([k]) => !excluded.has(k))
                   .every(([, v]) => v);
@@ -1839,6 +1853,9 @@ const WorldviewLeftPanel = React.memo(function WorldviewLeftPanel({
                                     </div>
                                   )}
                                 {/* SAR inline controls — AOI editor button */}
+                                {active && layer.id === 'road_corridor_trends' && (
+                                  <RoadCorridorLayerControls viewBoundsRef={viewBoundsRef} />
+                                )}
                                 {active && layer.id === 'sar' && onOpenSarAoiEditor && (
                                   <div
                                     className="ml-7 mt-2 flex items-center gap-2"

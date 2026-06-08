@@ -69,6 +69,7 @@ class DashboardData(TypedDict, total=False):
     sar_scenes: List[Dict[str, Any]]
     sar_anomalies: List[Dict[str, Any]]
     sar_aoi_coverage: List[Dict[str, Any]]
+    road_corridor_trends: Dict[str, Any]
 
 
 # In-memory store
@@ -119,6 +120,7 @@ latest_data: DashboardData = {
     "sar_scenes": [],
     "sar_anomalies": [],
     "sar_aoi_coverage": [],
+    "road_corridor_trends": {"updated_at": None, "corridors": []},
 }
 
 # Per-source freshness timestamps
@@ -230,12 +232,14 @@ _active_layers_version: int = 0
 def bump_active_layers_version() -> None:
     """Increment the active-layer version when frontend toggles change response shape."""
     global _active_layers_version
-    _active_layers_version += 1
+    with _data_lock:
+        _active_layers_version += 1
 
 
 def get_active_layers_version() -> int:
     """Return the current active-layer version (for ETag generation)."""
-    return _active_layers_version
+    with _data_lock:
+        return _active_layers_version
 
 
 def get_latest_data_subset(*keys: str) -> DashboardData:
@@ -326,6 +330,7 @@ active_layers: dict[str, bool] = {
     "ai_intel": True,
     "crowdthreat": False,
     "sar": True,
+    "road_corridor_trends": False,
 }
 
 

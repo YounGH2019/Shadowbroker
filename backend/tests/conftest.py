@@ -30,12 +30,6 @@ def client(_suppress_background_services):
     from main import app
     import asyncio
 
-    transport = ASGITransport(app=app)
-
-    async def _make_client():
-        async with AsyncClient(transport=transport, base_url="http://test") as ac:
-            return ac
-
     # Return a sync-usable wrapper
     class SyncClient:
         def __init__(self):

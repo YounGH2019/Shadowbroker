@@ -109,6 +109,9 @@ backend/data/*
 # release. Used ONLY on first-ever startup to bootstrap carrier_cache.json;
 # after that the cache reflects this install's own GDELT observations.
 !backend/data/carrier_seed.json
+# DrishX RF model weights (MIT — see backend/third_party/drishx/NOTICE.md)
+!backend/data/drishx/
+!backend/data/drishx/rf_model.pickle
 
 # OS generated files
 .DS_Store
@@ -199,6 +202,7 @@ graphify-out/
 # ========================
 docs/*
 !docs/OUTBOUND_DATA.md
+!docs/production-hardening.md
 !docs/mesh/
 docs/mesh/*
 !docs/mesh/threat-model.md
